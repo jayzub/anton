@@ -1,0 +1,569 @@
+diff --git a/src/services/Models/IListResponse.cs b/src/services/Models/IListResponse.cs
+index 7daee52d1..7972c75a9 100644
+--- a/src/services/Models/IListResponse.cs
++++ b/src/services/Models/IListResponse.cs
+@@ -30,4 +30,9 @@ public interface IListResponse
+     /// Number of records taken, passed from the ListRequest
+     /// </summary>
+     int Take { get; }
++
++    /// <summary>
++    /// Keyset pagination next page token.
++    /// </summary>
++    string? NextPageToken { get; }
+ }
+\ No newline at end of file
+diff --git a/src/services/Models/ListRequest.cs b/src/services/Models/ListRequest.cs
+index 8b0ba7466..b0241d92e 100644
+--- a/src/services/Models/ListRequest.cs
++++ b/src/services/Models/ListRequest.cs
+@@ -106,4 +106,10 @@ public class ListRequest : ServiceRequest, IIncludeExcludeColumns
+     /// version in a specific language, pass the language code as the value.
+     /// </summary>
+     public string? Localize { get; set; }
++
++    /// <summary>
++    /// Keyset pagination continuation token.
++    /// </summary>
++    [JsonConverter(typeof(JsonConverters.NullAsDefaultJsonConverter))]
++    public string? PageToken { get; set; }
+ }
+\ No newline at end of file
+diff --git a/src/services/Models/ListResponse.cs b/src/services/Models/ListResponse.cs
+index 08b479e53..7839ad6ce 100644
+--- a/src/services/Models/ListResponse.cs
++++ b/src/services/Models/ListResponse.cs
+@@ -31,4 +31,9 @@ public class ListResponse<T> : ServiceResponse, IListResponse
+ 
+     /// <inheritdoc/>
+     public int Take { get; set; }
++
++    /// <summary>
++    /// Keyset pagination next page token.
++    /// </summary>
++    public string? NextPageToken { get; set; }
+ }
+\ No newline at end of file
+diff --git a/src/services/RequestHandlers/List/ListRequestHandler.cs b/src/services/RequestHandlers/List/ListRequestHandler.cs
+index ba87f787e..754fe04f0 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandler.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandler.cs
+@@ -164,6 +164,7 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+         };
+ 
+         Row = new TRow();
++        ValidateKeysetRequest();
+ 
+         var query = CreateQuery();
+         Query = query;
+@@ -174,10 +175,13 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+ 
+         PrepareQuery(query);
+ 
+-        if (DistinctFields == null)
++        if (DistinctFields == null && string.IsNullOrEmpty(Request.PageToken))
+             ApplyKeyOrder(query);
+ 
+-        query.ApplySkipTakeAndCount(request.Skip, request.Take,
++        bool isKeysetActive = IsKeysetPagingActive();
++        int requestedTake = request.Take;
++
++        query.ApplySkipTakeAndCount(request.Skip, isKeysetActive ? (requestedTake + 1) : requestedTake,
+             request.ExcludeTotalCount || DistinctFields != null);
+ 
+         ApplyContainsText(query, request.ContainsText);
+@@ -186,12 +190,27 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+             ApplySort(query);
+ 
+         ApplyFilters(query);
++        ApplyKeysetFilter(query);
+ 
+         OnBeforeExecuteQuery();
+ 
+         if (DistinctFields == null || DistinctFields.Length > 0)
+         {
+             ExecuteQuery();
++
++            if (isKeysetActive)
++            {
++                if (Response.Entities.Count > requestedTake)
++                {
++                    Response.Entities.RemoveAt(Response.Entities.Count - 1);
++                    var lastEntity = Response.Entities[^1];
++                    Response.NextPageToken = GeneratePageToken(lastEntity);
++                }
++                else
++                {
++                    Response.NextPageToken = null;
++                }
++            }
+         }
+         else
+         {
+@@ -199,7 +218,13 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+             Response.Values = null;
+         }
+ 
++        query.Take(requestedTake);
+         Response.SetSkipTakeTotal(query);
++        if (isKeysetActive)
++        {
++            Response.Take = requestedTake;
++            Response.Skip = 0;
++        }
+ 
+         OnAfterExecuteQuery();
+ 
+diff --git a/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs b/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
+index d4fd52e28..2f3c6a60f 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
+@@ -166,6 +166,7 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+         };
+ 
+         Row = new TRow();
++        ValidateKeysetRequest();
+ 
+         var query = CreateQuery();
+         Query = query;
+@@ -176,10 +177,13 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+ 
+         await PrepareQueryAsync(query, cancellationToken).ConfigureAwait(false);
+ 
+-        if (DistinctFields == null)
++        if (DistinctFields == null && string.IsNullOrEmpty(Request.PageToken))
+             ApplyKeyOrder(query);
+ 
+-        query.ApplySkipTakeAndCount(request.Skip, request.Take,
++        bool isKeysetActive = IsKeysetPagingActive();
++        int requestedTake = request.Take;
++
++        query.ApplySkipTakeAndCount(request.Skip, isKeysetActive ? (requestedTake + 1) : requestedTake,
+             request.ExcludeTotalCount || DistinctFields != null);
+ 
+         ApplyContainsText(query, request.ContainsText);
+@@ -188,12 +192,27 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+             ApplySort(query);
+ 
+         await ApplyFiltersAsync(query, cancellationToken).ConfigureAwait(false);
++        ApplyKeysetFilter(query);
+ 
+         await OnBeforeExecuteQueryAsync(cancellationToken).ConfigureAwait(false);
+ 
+         if (DistinctFields == null || DistinctFields.Length > 0)
+         {
+             await ExecuteQueryAsync(cancellationToken).ConfigureAwait(false);
++
++            if (isKeysetActive)
++            {
++                if (Response.Entities.Count > requestedTake)
++                {
++                    Response.Entities.RemoveAt(Response.Entities.Count - 1);
++                    var lastEntity = Response.Entities[^1];
++                    Response.NextPageToken = GeneratePageToken(lastEntity);
++                }
++                else
++                {
++                    Response.NextPageToken = null;
++                }
++            }
+         }
+         else
+         {
+@@ -201,7 +220,13 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+             Response.Values = null;
+         }
+ 
++        query.Take(requestedTake);
+         Response.SetSkipTakeTotal(query);
++        if (isKeysetActive)
++        {
++            Response.Take = requestedTake;
++            Response.Skip = 0;
++        }
+ 
+         await OnAfterExecuteQueryAsync(cancellationToken).ConfigureAwait(false);
+ 
+diff --git a/src/services/RequestHandlers/List/ListRequestHandlerBase.cs b/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
+index 3c0c783ac..5036680cc 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
+@@ -1,5 +1,8 @@
+ using System.Collections;
++using System.Globalization;
+ using System.Runtime.CompilerServices;
++using System.Security.Cryptography;
++using System.Text.Json;
+ 
+ namespace Serenity.Services;
+ 
+@@ -221,6 +224,20 @@ public abstract class ListRequestHandlerBase<TRow, TListRequest, TListResponse>(
+             if (AllowSelectField(field) && ShouldSelectField(field))
+                 SelectField(query, field);
+         }
++
++        if (IsKeysetPagingActive() || !string.IsNullOrEmpty(Request.PageToken))
++        {
++            var effectiveSort = GetEffectiveSortForKeyset();
++            foreach (var sortBy in effectiveSort)
++            {
++                var field = Row.FindField(sortBy.Field) ?? Row.FindFieldByPropertyName(sortBy.Field);
++                if (field is not null && (field.Flags & FieldFlags.NotMapped) != FieldFlags.NotMapped && AllowSelectField(field))
++                {
++                    if (query is not ISqlQueryExtensible ext || !ext.Columns.Any(c => ReferenceEquals(c.IntoField, field)))
++                        SelectField(query, field);
++                }
++            }
++        }
+     }
+ 
+     /// <summary>
+@@ -636,10 +653,17 @@ public abstract class ListRequestHandlerBase<TRow, TListRequest, TListResponse>(
+     /// <param name="query">Query</param>
+     protected virtual void ApplySort(SqlQuery query)
+     {
+-        var sortByList = Request.Sort;
+-
+-        if (sortByList == null || sortByList.Length == 0)
+-            sortByList = GetNativeSort();
++        SortBy[]? sortByList;
++        if (!string.IsNullOrEmpty(Request.PageToken))
++        {
++            sortByList = GetEffectiveSortForKeyset();
++        }
++        else
++        {
++            sortByList = Request.Sort;
++            if (sortByList == null || sortByList.Length == 0)
++                sortByList = GetNativeSort();
++        }
+ 
+         if (sortByList != null)
+             for (var i = sortByList.Length - 1; i >= 0; i--)
+@@ -759,4 +783,326 @@ public abstract class ListRequestHandlerBase<TRow, TListRequest, TListResponse>(
+     IListResponse IListRequestHandler.Response => Response;
+     bool IListRequestHandler.AllowSelectField(Field field) { return AllowSelectField(field); }
+     bool IListRequestHandler.ShouldSelectField(Field field) { return ShouldSelectField(field); }
++
++    /// <summary>
++    /// Checks if keyset pagination is active for the current request.
++    /// </summary>
++    public virtual bool IsKeysetPagingActive()
++    {
++        return Row is IIdRow &&
++               Request.DistinctFields == null &&
++               Request.Skip == 0 &&
++               Request.Take > 0;
++    }
++
++    /// <summary>
++    /// Gets the effective sort order for keyset pagination, including the ID tiebreaker.
++    /// </summary>
++    public virtual SortBy[] GetEffectiveSortForKeyset()
++    {
++        var sortByList = Request.Sort;
++        if (sortByList == null || sortByList.Length == 0)
++            sortByList = GetNativeSort();
++
++        var list = sortByList != null ? [.. sortByList] : new List<SortBy>();
++
++        if (Row is IIdRow idRow && idRow.IdField is Field idField)
++        {
++            var idPropName = idField.PropertyName ?? idField.Name;
++            bool alreadyPresent = list.Any(s =>
++                string.Equals(s.Field, idField.Name, StringComparison.OrdinalIgnoreCase) ||
++                (idField.PropertyName != null && string.Equals(s.Field, idField.PropertyName, StringComparison.OrdinalIgnoreCase)));
++
++            if (!alreadyPresent)
++            {
++                list.Add(new SortBy(idPropName, false));
++            }
++        }
++
++        return [.. list];
++    }
++
++    /// <summary>
++    /// Validates keyset pagination constraints when PageToken is set.
++    /// </summary>
++    public virtual void ValidateKeysetRequest()
++    {
++        if (Request.PageToken != null)
++        {
++            if (Request.Take <= 0)
++                throw new ValidationError("TakeRequired", "Take must be greater than 0 when using PageToken.");
++
++            if (Request.Skip > 0)
++                throw new ValidationError("SkipNotAllowed", "Skip must be 0 when using PageToken.");
++
++            if (Request.DistinctFields != null)
++                throw new ValidationError("DistinctNotAllowed", "DistinctFields cannot be used with PageToken.");
++
++            if (Row is not IIdRow)
++                throw new ValidationError("IdRowRequired", "Entity must implement IIdRow when using PageToken.");
++
++            var effectiveSort = GetEffectiveSortForKeyset();
++            DecodeAndValidatePageToken(Request.PageToken, effectiveSort);
++        }
++    }
++
++    /// <summary>
++    /// Applies keyset seek filter to the query when PageToken is set.
++    /// </summary>
++    public virtual void ApplyKeysetFilter(SqlQuery query)
++    {
++        if (!string.IsNullOrEmpty(Request.PageToken))
++        {
++            var effectiveSort = GetEffectiveSortForKeyset();
++            var values = DecodeAndValidatePageToken(Request.PageToken, effectiveSort);
++            var seekCriteria = BuildSeekPredicate(effectiveSort, values, Connection.GetDialect());
++            if (!seekCriteria.IsEmpty)
++                query.Where(~(seekCriteria));
++        }
++    }
++
++    /// <summary>
++    /// Synthesizes a dialect-aware seek filter for the effective sort and boundary tuple.
++    /// </summary>
++    public virtual BaseCriteria BuildSeekPredicate(SortBy[] sortList, object?[] values, ISqlDialect dialect)
++    {
++        string serverType = dialect.ServerType ?? "";
++        bool nullsFirst = string.Equals(serverType, "SqlServer", StringComparison.OrdinalIgnoreCase) ||
++                          string.Equals(serverType, "MySql", StringComparison.OrdinalIgnoreCase) ||
++                          string.Equals(serverType, "Sqlite", StringComparison.OrdinalIgnoreCase);
++
++        BaseCriteria totalCriteria = Criteria.Empty;
++        BaseCriteria prefixEquality = Criteria.Empty;
++
++        for (int i = 0; i < sortList.Length; i++)
++        {
++            var sortBy = sortList[i];
++            var field = Row.FindField(sortBy.Field) ?? Row.FindFieldByPropertyName(sortBy.Field);
++            if (field is null)
++                continue;
++
++            var colCriteria = ToCriteria(field);
++            var val = (i < values.Length) ? values[i] : null;
++            bool desc = sortBy.Descending;
++            bool nullsAreAfterNonNull = (nullsFirst == desc);
++
++            BaseCriteria strictlyAfter;
++
++            if (val == null)
++            {
++                if (nullsAreAfterNonNull)
++                {
++                    strictlyAfter = Criteria.Empty;
++                }
++                else
++                {
++                    strictlyAfter = colCriteria.IsNotNull();
++                }
++            }
++            else
++            {
++                BaseCriteria comp = new BinaryCriteria(colCriteria, desc ? CriteriaOperator.LT : CriteriaOperator.GT, new ValueCriteria(val));
++                if (nullsAreAfterNonNull)
++                {
++                    strictlyAfter = comp | colCriteria.IsNull();
++                }
++                else
++                {
++                    strictlyAfter = comp;
++                }
++            }
++
++            if (!strictlyAfter.IsEmpty)
++            {
++                var term = prefixEquality.IsEmpty ? strictlyAfter : (prefixEquality & strictlyAfter);
++                totalCriteria = totalCriteria.IsEmpty ? term : (totalCriteria | term);
++            }
++
++            BaseCriteria equalsCriteria;
++            if (val == null)
++                equalsCriteria = colCriteria.IsNull();
++            else
++                equalsCriteria = new BinaryCriteria(colCriteria, CriteriaOperator.EQ, new ValueCriteria(val));
++
++            prefixEquality = prefixEquality.IsEmpty ? equalsCriteria : (prefixEquality & equalsCriteria);
++        }
++
++        return totalCriteria;
++    }
++
++    private class KeysetPageTokenPayload
++    {
++        public string Fp { get; set; } = "";
++        public string Sig { get; set; } = "";
++        public List<KeysetValueItem> V { get; set; } = [];
++    }
++
++    private class KeysetValueItem
++    {
++        public string T { get; set; } = "";
++        public string? S { get; set; }
++        public long? L1 { get; set; }
++        public long? L2 { get; set; }
++        public double? D { get; set; }
++        public bool? B { get; set; }
++    }
++
++    private static readonly byte[] HmacSecret = [0x53, 0x65, 0x72, 0x65, 0x6E, 0x69, 0x74, 0x79, 0x4B, 0x65, 0x79, 0x73, 0x65, 0x74, 0x54, 0x6F];
++
++    /// <summary>
++    /// Generates a continuation token from the last returned entity.
++    /// </summary>
++    public virtual string GeneratePageToken(TRow entity)
++    {
++        var effectiveSort = GetEffectiveSortForKeyset();
++        var fp = ComputeRequestFingerprint(effectiveSort, Request);
++        var payload = new KeysetPageTokenPayload
++        {
++            Fp = fp,
++            V = []
++        };
++
++        foreach (var sortBy in effectiveSort)
++        {
++            var field = Row.FindField(sortBy.Field) ?? Row.FindFieldByPropertyName(sortBy.Field);
++            object? val = field is not null ? field.AsObject(entity) : null;
++            payload.V.Add(EncodeValueItem(val));
++        }
++
++        using var hmac = new HMACSHA256(HmacSecret);
++        var rawValues = JsonSerializer.Serialize(payload.V);
++        var bytesToSign = System.Text.Encoding.UTF8.GetBytes(fp + "|" + rawValues);
++        payload.Sig = Convert.ToBase64String(hmac.ComputeHash(bytesToSign));
++
++        var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(payload);
++        return Convert.ToBase64String(jsonBytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
++    }
++
++    /// <summary>
++    /// Decodes and validates a continuation token against the current request shape.
++    /// </summary>
++    public virtual object?[] DecodeAndValidatePageToken(string token, SortBy[] effectiveSort)
++    {
++        if (string.IsNullOrWhiteSpace(token))
++            throw new ValidationError("InvalidPageToken", "Continuation token cannot be empty.");
++
++        KeysetPageTokenPayload? payload;
++        try
++        {
++            string incoming = token.Replace('-', '+').Replace('_', '/');
++            switch (incoming.Length % 4)
++            {
++                case 2: incoming += "=="; break;
++                case 3: incoming += "="; break;
++            }
++            byte[] bytes = Convert.FromBase64String(incoming);
++            payload = JsonSerializer.Deserialize<KeysetPageTokenPayload>(bytes);
++        }
++        catch (Exception)
++        {
++            throw new ValidationError("InvalidPageToken", "Continuation token is malformed.");
++        }
++
++        if (payload == null || payload.V == null)
++            throw new ValidationError("InvalidPageToken", "Continuation token is invalid.");
++
++        using var hmac = new HMACSHA256(HmacSecret);
++        var rawValues = JsonSerializer.Serialize(payload.V);
++        var bytesToSign = System.Text.Encoding.UTF8.GetBytes(payload.Fp + "|" + rawValues);
++        var expectedSig = Convert.ToBase64String(hmac.ComputeHash(bytesToSign));
++        if (!string.Equals(payload.Sig, expectedSig, StringComparison.Ordinal))
++            throw new ValidationError("CorruptedPageToken", "Continuation token signature mismatch or corrupted.");
++
++        var currentFp = ComputeRequestFingerprint(effectiveSort, Request);
++        if (!string.Equals(payload.Fp, currentFp, StringComparison.Ordinal))
++            throw new ValidationError("TokenMismatch", "Continuation token was generated for a different sort order, criteria, or filter.");
++
++        var result = new object?[payload.V.Count];
++        for (int i = 0; i < payload.V.Count; i++)
++        {
++            result[i] = DecodeValueItem(payload.V[i]);
++        }
++        return result;
++    }
++
++    private static string ComputeRequestFingerprint(SortBy[] effectiveSort, ListRequest request)
++    {
++        var sb = new StringBuilder();
++        foreach (var s in effectiveSort)
++            sb.Append(s.Field).Append(':').Append(s.Descending ? "1" : "0").Append(';');
++        sb.Append('|');
++        if (request.Criteria is not null && !request.Criteria.IsEmpty)
++            sb.Append(request.Criteria.ToStringIgnoreParams());
++        sb.Append('|');
++        if (request.EqualityFilter != null && request.EqualityFilter.Count > 0)
++        {
++            foreach (var kvp in request.EqualityFilter.OrderBy(k => k.Key, StringComparer.Ordinal))
++                sb.Append(kvp.Key).Append('=').Append(kvp.Value?.ToString() ?? "null").Append(';');
++        }
++        sb.Append('|');
++        if (!string.IsNullOrEmpty(request.ContainsText))
++            sb.Append(request.ContainsText);
++        sb.Append('|');
++        if (!string.IsNullOrEmpty(request.ContainsField))
++            sb.Append(request.ContainsField);
++        sb.Append('|');
++        sb.Append(request.IncludeDeleted ? "1" : "0");
++        return sb.ToString();
++    }
++
++    private static KeysetValueItem EncodeValueItem(object? val)
++    {
++        if (val == null)
++            return new KeysetValueItem { T = "null" };
++
++        if (val is string s)
++            return new KeysetValueItem { T = "str", S = s };
++
++        if (val is bool b)
++            return new KeysetValueItem { T = "bool", B = b };
++
++        if (val is DateTime dt)
++            return new KeysetValueItem { T = "dt", L1 = dt.Ticks, S = dt.Kind.ToString() };
++
++        if (val is DateTimeOffset dto)
++            return new KeysetValueItem { T = "dto", L1 = dto.Ticks, L2 = dto.Offset.Ticks };
++
++        if (val is Guid g)
++            return new KeysetValueItem { T = "guid", S = g.ToString("D") };
++
++        if (val is decimal dec)
++            return new KeysetValueItem { T = "dec", S = dec.ToString(CultureInfo.InvariantCulture) };
++
++        if (val is double dbl)
++            return new KeysetValueItem { T = "dbl", D = dbl };
++
++        if (val is float flt)
++            return new KeysetValueItem { T = "dbl", D = (double)flt };
++
++        if (val is Enum en)
++            return new KeysetValueItem { T = "enum", L1 = Convert.ToInt64(en) };
++
++        if (val is int or long or short or byte or sbyte or uint or ulong or ushort)
++            return new KeysetValueItem { T = "int", L1 = Convert.ToInt64(val) };
++
++        return new KeysetValueItem { T = "str", S = val.ToString() };
++    }
++
++    private static object? DecodeValueItem(KeysetValueItem item)
++    {
++        return item.T switch
++        {
++            "null" => null,
++            "str" => item.S,
++            "bool" => item.B,
++            "dt" => new DateTime(item.L1!.Value, (DateTimeKind)Enum.Parse(typeof(DateTimeKind), item.S ?? "Unspecified")),
++            "dto" => new DateTimeOffset(item.L1!.Value, TimeSpan.FromTicks(item.L2!.Value)),
++            "guid" => Guid.Parse(item.S!),
++            "dec" => decimal.Parse(item.S!, CultureInfo.InvariantCulture),
++            "dbl" => item.D,
++            "int" => item.L1,
++            "enum" => item.L1.HasValue ? Convert.ToInt32(item.L1.Value) : null,
++            _ => item.S
++        };
++    }
+ }

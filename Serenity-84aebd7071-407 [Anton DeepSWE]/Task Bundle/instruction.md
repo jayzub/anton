@@ -1,0 +1,13 @@
+Serenity's list request handlers only support Skip/Take offset pagination. Add server-side keyset continuation pagination across both synchronous and asynchronous list request handlers.
+
+`ListRequest` gains an optional string property named `PageToken`, and `ListResponse<T>` gains an optional string property named `NextPageToken`. When set, the handler resumes listing strictly after the boundary row represented by the token; when null or absent, it returns the first page.
+
+Keyset pagination requires `Take > 0`, `Skip == 0`, `DistinctFields == null`, and an entity implementing `IIdRow`. On a first-page request, failing any of these leaves keyset pagination inactive (the next page token remains null). When a token is provided, failing any precondition—or supplying a token that is malformed, corrupted, or replayed against a different effective sort order, `Criteria`, `EqualityFilter`, `ContainsText`, `ContainsField`, or `IncludeDeleted`—must throw `ValidationError`.
+
+Effective sort order for keyset pagination uses the request sort (or the handler's native sort order when empty), appending the entity's primary key ID field as an ascending tiebreaker if not already present. On a first-page request without a token, existing handler sort ordering is preserved verbatim.
+
+Boundary sort values extracted from the last returned entity must round-trip through the token preserving type and precision across `DateTime`, `DateTimeOffset`, `Guid`, `decimal`, floating-point, boolean, enum, string, and null values. Sort and tiebreaker columns must be selected so values can be extracted even when restricted by `ColumnSelection.KeyOnly` or `ExcludeColumns`. Mapped field expressions (such as localization rewrites) must be used consistently between ordering and seek filtering.
+
+The seek filter must restrict results to rows strictly after the boundary row under the effective multi-column sort, parameterizing non-null comparison values rather than inlining them. The predicate must match dialect-specific NULL ordering under both ascending and descending directions across dialects where NULLs sort first (SQL Server, MySQL, SQLite) and dialects where NULLs sort last (PostgreSQL, Oracle, Firebird).
+
+To detect subsequent pages, the handler over-fetches at most `Take + 1` rows. The probe row must never appear in the returned entities, response `Take` must match requested `Take`, response `Skip` must remain 0 when paging with a token, and total count calculation semantics must remain unchanged. The next page token is populated with a URL-safe opaque string when additional rows exist, and is null on the final page, when no further rows match, or when keyset paging is inactive.

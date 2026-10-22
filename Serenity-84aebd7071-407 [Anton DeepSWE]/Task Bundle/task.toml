@@ -1,0 +1,44 @@
+schema_version = "1.1"
+artifacts = ["/logs/artifacts/model.patch"]
+
+[task]
+name = "mercor/serenity-keyset-continuation-paging"
+description = ""
+authors = []
+keywords = []
+
+[metadata]
+ext_id              = "e373dbdeba1ee4b3aa50cac07968e608"
+task_id             = "serenity-keyset-continuation-paging"
+display_title       = "Add keyset continuation paging to list request pipeline"
+display_description = "Add server-side keyset pagination with PageToken and NextPageToken to ListRequest, ListResponse, and ListRequestHandler."
+original_title      = "Keyset continuation paging for ListRequest"
+category            = "feature_request"
+language            = "csharp"
+subdomain           = "backend"
+repository_url       = "https://github.com/serenity-is/Serenity"
+base_commit_hash    = "1f741fd1f247f5956655c1ab237ca16d7b7ca499"
+
+[verifier]
+environment_mode = "shared"
+timeout_sec      = 1800.0
+user             = "root"
+
+[verifier.env]
+
+[agent]
+timeout_sec = 5400.0
+
+[environment]
+build_timeout_sec = 1800.0
+workdir      = "/app"
+os           = "linux"
+cpus         = 2
+memory_mb    = 8192
+storage_mb   = 20480
+gpus         = 0
+allow_internet = false
+mcp_servers  = []
+
+[environment.env]
+[solution.env]

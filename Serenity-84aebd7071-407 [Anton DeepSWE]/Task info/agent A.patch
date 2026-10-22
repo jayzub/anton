@@ -1,0 +1,1082 @@
+diff --git a/docs/keyset-pagination.md b/docs/keyset-pagination.md
+new file mode 100644
+index 000000000..a0030d73b
+--- /dev/null
++++ b/docs/keyset-pagination.md
+@@ -0,0 +1,37 @@
++# List continuation pagination
++
++Synchronous and asynchronous list handlers return `NextPageToken` when a request
++has `Take > 0`, `Skip == 0`, no `DistinctFields` (including an empty array), an
++`IIdRow` entity, and more matching rows. Send that token as `PageToken` to fetch
++the next page. Stop when `NextPageToken` is null. A missing or null `PageToken`
++starts a new listing. Ordinary offset and distinct requests continue to work,
++but do not return continuation tokens.
++
++```json
++{ "Take": 50, "Sort": ["Name"], "ExcludeTotalCount": true }
++```
++
++For the next page, repeat the request with `"PageToken": "<NextPageToken>"`.
++Keep the sort, criteria, equality filters, quick-search text and field, and
++`IncludeDeleted` unchanged. The page size and column selection may change.
++Invalid, altered, or incompatible tokens produce `ValidationError` with code
++`InvalidPageToken`. Tokens are opaque: clients should not parse or modify them.
++
++Continuation ordering uses the requested sort, or the handler's native sort,
++with the ID ascending as a unique tiebreaker unless already included. The initial
++request retains the handler's existing ordering. Required sort and ID fields
++are selected even with `KeyOnly` or column exclusions; field read permissions
++are still enforced. A sort requiring an unreadable field disables continuation
++on the initial request and rejects a continuation request.
++
++Handlers fetch at most one extra row to detect another page. That probe is not
++processed or returned. `Take` still reports the requested page size, `Skip`
++remains zero, and `TotalCount` continues to count all matching rows rather than
++only rows after the boundary. `ExcludeTotalCount` retains its existing meaning.
++
++Tokens use authenticated encryption and preserve boundary value types and
++precision. The current token key is process-scoped: application restarts
++invalidate outstanding tokens, and multi-worker deployments need worker
++affinity for a listing. A client receiving an invalid-token error can restart
++from the first page. Continuations are not database snapshots; concurrent
++changes to a row's sort values can move it across the boundary.
+diff --git a/packages/corelib/src/base/servicetypes.ts b/packages/corelib/src/base/servicetypes.ts
+index ad343acb7..5802fbf7a 100644
+--- a/packages/corelib/src/base/servicetypes.ts
++++ b/packages/corelib/src/base/servicetypes.ts
+@@ -128,6 +128,8 @@ export interface ListRequest extends ServiceRequest {
+     Skip?: number;
+     /** Maximum number of records to take (page size). Omit or 0 for server default. */
+     Take?: number;
++    /** Opaque continuation token from the previous page. Requires Take > 0, Skip == 0, and no DistinctFields. */
++    PageToken?: string;
+     /** Sort expressions, e.g. `["Name ASC", "Age DESC"]`. */
+     Sort?: string[];
+     /** Quick-search text applied across searchable fields (or {@link ContainsField} when specified). */
+@@ -171,6 +173,8 @@ export interface ListResponse<TEntity> extends ServiceResponse {
+     Skip?: number;
+     /** Echo of `Take` from the request. */
+     Take?: number;
++    /** Opaque continuation token, or null when no further page is available. */
++    NextPageToken?: string;
+ }
+ 
+ /**
+diff --git a/src/services/Data/FluentSql/SqlQuery.cs b/src/services/Data/FluentSql/SqlQuery.cs
+index 543143bf4..47fe2fd8f 100644
+--- a/src/services/Data/FluentSql/SqlQuery.cs
++++ b/src/services/Data/FluentSql/SqlQuery.cs
+@@ -26,6 +26,10 @@ public partial class SqlQuery : QueryWithParams, ISqlQuery, IFilterableQuery, IG
+     private int skip;
+     private int take;
+     private StringBuilder? where;
++
++    // Keyset boundaries limit the page, not the total count. Null uses the
++    // ordinary WHERE clause; an empty string explicitly means no count filter.
++    internal string? WhereForCount { get; set; }
+     private int intoIndex = -1;
+     private List<object> into = [];
+     private SqlQuery? unionQuery;
+diff --git a/src/services/Data/FluentSql/SqlQuery_Clone.cs b/src/services/Data/FluentSql/SqlQuery_Clone.cs
+index 3fbca24ca..6c3118385 100644
+--- a/src/services/Data/FluentSql/SqlQuery_Clone.cs
++++ b/src/services/Data/FluentSql/SqlQuery_Clone.cs
+@@ -19,6 +19,7 @@ public partial class SqlQuery
+             skip = skip,
+             take = take,
+             countRecords = countRecords,
++            WhereForCount = WhereForCount,
+             distinct = distinct,
+             omitParens = omitParens,
+             into = [.. into],
+diff --git a/src/services/Data/FluentSql/SqlQuery_ToString.cs b/src/services/Data/FluentSql/SqlQuery_ToString.cs
+index 64e860b7b..96661e44e 100644
+--- a/src/services/Data/FluentSql/SqlQuery_ToString.cs
++++ b/src/services/Data/FluentSql/SqlQuery_ToString.cs
+@@ -71,24 +71,26 @@ public partial class SqlQuery
+         bool useRowNumber = skip > 0 && !useSkipKeyword && !useOffset && !useRowNum && dialect.CanUseRowNumber;
+         bool useSecondQuery = skip > 0 && !useSkipKeyword && !useRowNum && !useOffset && !useRowNumber;
+ 
+-        void appendFromWhereOrderByGroupByHaving(string? extraWhere, bool includeOrderBy)
++        void appendFromWhereOrderByGroupByHaving(string? extraWhere, bool includeOrderBy, bool forCount = false)
+         {
++            var where = forCount ? (query as SqlQuery)?.WhereForCount ?? query.Where : query.Where;
++
+             if (!string.IsNullOrEmpty(query.From))
+             {
+                 sb.Append(SqlKeywords.From);
+                 sb.Append(query.From);
+             }
+ 
+-            if (extraWhere != null || !string.IsNullOrEmpty(query.Where))
++            if (extraWhere != null || !string.IsNullOrEmpty(where))
+             {
+                 sb.Append(SqlKeywords.Where);
+ 
+-                if (!string.IsNullOrEmpty(query.Where))
+-                    sb.Append(query.Where);
++                if (!string.IsNullOrEmpty(where))
++                    sb.Append(where);
+ 
+                 if (extraWhere != null)
+                 {
+-                    if (!string.IsNullOrEmpty(query.Where))
++                    if (!string.IsNullOrEmpty(where))
+                         sb.Append(" AND ");
+                     sb.Append(extraWhere);
+                 }
+@@ -421,7 +423,7 @@ public partial class SqlQuery
+                 sb.Append(" 1 as x__alias__x ");
+             }
+ 
+-            appendFromWhereOrderByGroupByHaving(null, false);
++            appendFromWhereOrderByGroupByHaving(null, false, forCount: true);
+ 
+             if (query.Distinct || (!string.IsNullOrEmpty(query.GroupBy)))
+             {
+diff --git a/src/services/Models/ListRequest.cs b/src/services/Models/ListRequest.cs
+index 8b0ba7466..7f89e7fa0 100644
+--- a/src/services/Models/ListRequest.cs
++++ b/src/services/Models/ListRequest.cs
+@@ -17,6 +17,12 @@ public class ListRequest : ServiceRequest, IIncludeExcludeColumns
+     [JsonConverter(typeof(JsonConverters.NullAsDefaultJsonConverter))]
+     public int Take { get; set; }
+ 
++    /// <summary>
++    /// Opaque continuation token from a previous list response. Requires Take > 0,
++    /// Skip == 0, no DistinctFields, and an entity implementing IIdRow.
++    /// </summary>
++    public string? PageToken { get; set; }
++
+     /// <summary>
+     /// Columns to sort returned records by
+     /// </summary>
+diff --git a/src/services/Models/ListResponse.cs b/src/services/Models/ListResponse.cs
+index 08b479e53..4ff134389 100644
+--- a/src/services/Models/ListResponse.cs
++++ b/src/services/Models/ListResponse.cs
+@@ -23,6 +23,11 @@ public class ListResponse<T> : ServiceResponse, IListResponse
+     /// </summary>
+     public List<object?>? Values { get; set; }
+ 
++    /// <summary>
++    /// Opaque continuation token, or null when there are no more pages.
++    /// </summary>
++    public string? NextPageToken { get; set; }
++
+     /// <inheritdoc/>
+     public int TotalCount { get; set; }
+ 
+diff --git a/src/services/RequestHandlers/List/ListPageToken.cs b/src/services/RequestHandlers/List/ListPageToken.cs
+new file mode 100644
+index 000000000..f1e97c6c3
+--- /dev/null
++++ b/src/services/RequestHandlers/List/ListPageToken.cs
+@@ -0,0 +1,137 @@
++using System.IO;
++using System.Security.Cryptography;
++
++namespace Serenity.Services;
++
++/// <summary>
++/// Private, versioned wire format for list continuations. Tokens are authenticated
++/// and encrypted, and intentionally valid only for this application lifetime.
++/// No runtime type names from untrusted input are resolved or instantiated.
++/// </summary>
++internal static class ListPageToken
++{
++    private static readonly byte[] key = RandomNumberGenerator.GetBytes(32);
++
++    internal static ValidationError Invalid() => new("InvalidPageToken", "PageToken",
++        "The page token is invalid or does not match this list request.");
++
++    internal static string Write(byte[] fingerprint, object?[] values)
++    {
++        using var stream = new MemoryStream();
++        using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
++        {
++            writer.Write((byte)1);
++            writer.Write(fingerprint);
++            writer.Write(values.Length);
++            foreach (var value in values)
++                WriteValue(writer, value);
++        }
++
++        var plaintext = stream.ToArray();
++        var output = new byte[12 + 16 + plaintext.Length];
++        RandomNumberGenerator.Fill(output.AsSpan(0, 12));
++        using var aes = new AesGcm(key, 16);
++        aes.Encrypt(output.AsSpan(0, 12), plaintext, output.AsSpan(28), output.AsSpan(12, 16));
++        return Encode(output);
++    }
++
++    internal static object?[] Read(string token, byte[] fingerprint, Field[] fields)
++    {
++        try
++        {
++            if (token.Length < 40 || token.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '-' && c != '_'))
++                throw Invalid();
++            var encoded = token.Replace('-', '+').Replace('_', '/');
++            var bytes = Convert.FromBase64String(encoded.PadRight((encoded.Length + 3) / 4 * 4, '='));
++            // Reject alternate encodings with nonzero unused padding bits as well.
++            if (Encode(bytes) != token)
++                throw Invalid();
++            var plaintext = new byte[bytes.Length - 28];
++            using var aes = new AesGcm(key, 16);
++            aes.Decrypt(bytes.AsSpan(0, 12), bytes.AsSpan(28), bytes.AsSpan(12, 16), plaintext);
++            using var stream = new MemoryStream(plaintext);
++            using var reader = new BinaryReader(stream, Encoding.UTF8);
++            if (reader.ReadByte() != 1 || !reader.ReadBytes(32).AsSpan().SequenceEqual(fingerprint) ||
++                reader.ReadInt32() != fields.Length)
++                throw Invalid();
++
++            var values = fields.Select(field => ReadValue(reader, field)).ToArray();
++            if (stream.Position != stream.Length)
++                throw Invalid();
++            return values;
++        }
++        catch (Exception ex) when (ex is CryptographicException or ArgumentException or
++            IOException or FormatException or OverflowException)
++        {
++            throw Invalid();
++        }
++    }
++
++    private static string Encode(byte[] bytes) => Convert.ToBase64String(bytes)
++        .TrimEnd('=').Replace('+', '-').Replace('/', '_');
++
++    // Binary primitives retain decimal scale, all floating-point bits, DateTime
++    // kind/ticks and DateTimeOffset offset/ticks, independently of JSON settings.
++    private static void WriteValue(BinaryWriter writer, object? value)
++    {
++        switch (value)
++        {
++            case null or DBNull: writer.Write((byte)0); break;
++            case string x: writer.Write((byte)1); writer.Write(x); break;
++            case bool x: writer.Write((byte)2); writer.Write(x); break;
++            case byte x: writer.Write((byte)3); writer.Write(x); break;
++            case sbyte x: writer.Write((byte)4); writer.Write(x); break;
++            case short x: writer.Write((byte)5); writer.Write(x); break;
++            case ushort x: writer.Write((byte)6); writer.Write(x); break;
++            case int x: writer.Write((byte)7); writer.Write(x); break;
++            case uint x: writer.Write((byte)8); writer.Write(x); break;
++            case long x: writer.Write((byte)9); writer.Write(x); break;
++            case ulong x: writer.Write((byte)10); writer.Write(x); break;
++            case decimal x: writer.Write((byte)11); writer.Write(x); break;
++            case float x: writer.Write((byte)12); writer.Write(x); break;
++            case double x: writer.Write((byte)13); writer.Write(x); break;
++            case DateTime x: writer.Write((byte)14); writer.Write(x.ToBinary()); break;
++            case DateTimeOffset x:
++                writer.Write((byte)15); writer.Write(x.Ticks); writer.Write(x.Offset.Ticks); break;
++            case Guid x: writer.Write((byte)16); writer.Write(x.ToByteArray()); break;
++            case Enum x:
++                writer.Write((byte)17);
++                writer.Write(x.GetType().FullName!);
++                WriteValue(writer, Convert.ChangeType(x, Enum.GetUnderlyingType(x.GetType()), CultureInfo.InvariantCulture));
++                break;
++            default: throw new InvalidOperationException($"Unsupported page token value type: {value.GetType()}");
++        }
++    }
++
++    private static object? ReadValue(BinaryReader reader, Field field) => reader.ReadByte() switch
++    {
++        0 => null,
++        1 => reader.ReadString(),
++        2 => reader.ReadBoolean(),
++        3 => reader.ReadByte(),
++        4 => reader.ReadSByte(),
++        5 => reader.ReadInt16(),
++        6 => reader.ReadUInt16(),
++        7 => reader.ReadInt32(),
++        8 => reader.ReadUInt32(),
++        9 => reader.ReadInt64(),
++        10 => reader.ReadUInt64(),
++        11 => reader.ReadDecimal(),
++        12 => reader.ReadSingle(),
++        13 => reader.ReadDouble(),
++        14 => DateTime.FromBinary(reader.ReadInt64()),
++        15 => new DateTimeOffset(reader.ReadInt64(), new TimeSpan(reader.ReadInt64())),
++        16 => new Guid(reader.ReadBytes(16)),
++        17 => ReadEnum(reader, field),
++        _ => throw Invalid()
++    };
++
++    private static object ReadEnum(BinaryReader reader, Field field)
++    {
++        var name = reader.ReadString();
++        var type = (field as IEnumTypeField)?.EnumType ?? Nullable.GetUnderlyingType(field.ValueType) ?? field.ValueType;
++        if (!type.IsEnum || type.FullName != name)
++            throw Invalid();
++        return Enum.ToObject(type, ReadValue(reader, field) ?? throw Invalid());
++    }
++}
+diff --git a/src/services/RequestHandlers/List/ListRequestHandler.cs b/src/services/RequestHandlers/List/ListRequestHandler.cs
+index ba87f787e..be81417f8 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandler.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandler.cs
+@@ -118,6 +118,9 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+         {
+             Response.TotalCount = Query.ForEach(Connection, delegate ()
+             {
++                if (!ProcessKeysetRow())
++                    return;
++
+                 var clone = ProcessEntity(Row.Clone());
+                 if (clone == null)
+                     return;
+@@ -164,6 +167,7 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+         };
+ 
+         Row = new TRow();
++        InitializeKeysetPagination();
+ 
+         var query = CreateQuery();
+         Query = query;
+@@ -174,6 +178,8 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+ 
+         PrepareQuery(query);
+ 
++        SelectKeysetFields();
++
+         if (DistinctFields == null)
+             ApplyKeyOrder(query);
+ 
+@@ -189,6 +195,8 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+ 
+         OnBeforeExecuteQuery();
+ 
++        ApplyKeysetPagination();
++
+         if (DistinctFields == null || DistinctFields.Length > 0)
+         {
+             ExecuteQuery();
+@@ -200,6 +208,7 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+         }
+ 
+         Response.SetSkipTakeTotal(query);
++        CompleteKeysetPagination();
+ 
+         OnAfterExecuteQuery();
+ 
+diff --git a/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs b/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
+index d4fd52e28..6279a3d9d 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
+@@ -118,6 +118,9 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+         {
+             Response.TotalCount = await Query.ForEachAsync(Connection, delegate ()
+             {
++                if (!ProcessKeysetRow())
++                    return;
++
+                 var clone = ProcessEntity(Row.Clone());
+                 if (clone == null)
+                     return;
+@@ -166,6 +169,7 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+         };
+ 
+         Row = new TRow();
++        InitializeKeysetPagination();
+ 
+         var query = CreateQuery();
+         Query = query;
+@@ -176,6 +180,8 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+ 
+         await PrepareQueryAsync(query, cancellationToken).ConfigureAwait(false);
+ 
++        SelectKeysetFields();
++
+         if (DistinctFields == null)
+             ApplyKeyOrder(query);
+ 
+@@ -191,6 +197,8 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+ 
+         await OnBeforeExecuteQueryAsync(cancellationToken).ConfigureAwait(false);
+ 
++        ApplyKeysetPagination();
++
+         if (DistinctFields == null || DistinctFields.Length > 0)
+         {
+             await ExecuteQueryAsync(cancellationToken).ConfigureAwait(false);
+@@ -202,6 +210,7 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+         }
+ 
+         Response.SetSkipTakeTotal(query);
++        CompleteKeysetPagination();
+ 
+         await OnAfterExecuteQueryAsync(cancellationToken).ConfigureAwait(false);
+ 
+diff --git a/src/services/RequestHandlers/List/ListRequestHandlerBase.Keyset.cs b/src/services/RequestHandlers/List/ListRequestHandlerBase.Keyset.cs
+new file mode 100644
+index 000000000..753595b82
+--- /dev/null
++++ b/src/services/RequestHandlers/List/ListRequestHandlerBase.Keyset.cs
+@@ -0,0 +1,188 @@
++using Newtonsoft.Json.Linq;
++using System.Security.Cryptography;
++
++namespace Serenity.Services;
++
++public abstract partial class ListRequestHandlerBase<TRow, TListRequest, TListResponse>
++{
++    private List<(Field Field, bool Descending)>? keysetSort;
++    private string[]? keysetExpressions;
++    private byte[]? keysetFingerprint;
++    private object?[]? keysetBoundary;
++    private int keysetRowsRead;
++    private bool keysetHasMore;
++
++    private protected void InitializeKeysetPagination()
++    {
++        keysetSort = null;
++        keysetExpressions = null;
++        keysetFingerprint = null;
++        keysetBoundary = null;
++        keysetRowsRead = 0;
++        keysetHasMore = false;
++
++        if (Request.Take <= 0 || Request.Skip != 0 || Request.DistinctFields != null || Row is not IIdRow)
++        {
++            if (Request.PageToken != null)
++                throw ListPageToken.Invalid();
++            return;
++        }
++
++        var sort = new List<(Field Field, bool Descending)>();
++        foreach (var item in Request.Sort is { Length: > 0 } ? Request.Sort : GetNativeSort() ?? [])
++        {
++            var name = item.Field.TrimToNull();
++            if (name == null)
++                continue;
++            var field = Row.FindField(name) ?? Row.FindFieldByPropertyName(name);
++            // These sorts are also ignored by ApplySortBy.
++            if (field is null || field.Flags.HasFlag(FieldFlags.NotMapped) ||
++                field.GetAttribute<SortableAttribute>()?.Value == false)
++                continue;
++            if (!sort.Any(x => ReferenceEquals(x.Field, field)))
++                sort.Add((field, item.Descending));
++        }
++
++        var id = ((IIdRow)Row).GetIdField();
++        if (!sort.Any(x => ReferenceEquals(x.Field, id)))
++            sort.Add((id, false));
++
++        // Column selection exclusions can be overridden, but read permissions cannot.
++        if (sort.Any(x => !AllowSelectField(x.Field)))
++        {
++            if (Request.PageToken != null)
++                throw ListPageToken.Invalid();
++            return;
++        }
++        keysetSort = sort;
++    }
++
++    private protected void SelectKeysetFields()
++    {
++        if (keysetSort == null)
++            return;
++
++        var ext = (ISqlQueryExtensible)Query;
++        foreach (var (field, _) in keysetSort)
++            if (ext.GetSelectIntoIndex(field) < 0)
++                SelectField(Query, field);
++
++        // Use exactly the selected expressions, including any localization rewrites.
++        keysetExpressions = keysetSort.Select(x =>
++            ext.Columns[ext.GetSelectIntoIndex(x.Field)].Expression).ToArray();
++        var filters = new ListRequest
++        {
++            Criteria = Request.Criteria,
++            EqualityFilter = Request.EqualityFilter,
++            ContainsText = Request.ContainsText,
++            ContainsField = Request.ContainsField,
++            IncludeDeleted = Request.IncludeDeleted
++        };
++        var signature = JObject.FromObject(new
++        {
++            Row = typeof(TRow).AssemblyQualifiedName,
++            Dialect = Query.Dialect().ServerType,
++            Sort = keysetSort.Select((x, i) => new { x.Field.Name, x.Descending, Expression = keysetExpressions[i] }),
++            Filters = filters
++        });
++        keysetFingerprint = SHA256.HashData(Encoding.UTF8.GetBytes(Canonicalize(signature).ToString(Newtonsoft.Json.Formatting.None)));
++
++        if (Request.PageToken != null)
++            keysetBoundary = ListPageToken.Read(Request.PageToken, keysetFingerprint,
++                keysetSort.Select(x => x.Field).ToArray());
++    }
++
++    private protected void ApplyKeysetPagination()
++    {
++        if (keysetSort == null)
++            return;
++
++        if (keysetBoundary != null)
++        {
++            // Do not change the native first-page ordering. On continuation, make
++            // the canonical order explicit, including the unique ID tiebreaker.
++            for (var i = keysetSort.Count - 1; i >= 0; i--)
++                Query.OrderByFirst(keysetExpressions![i], keysetSort[i].Descending);
++
++            Query.WhereForCount = ((ISqlQuery)Query).Where ?? "";
++            Query.Where(BuildSeekCriteria(keysetBoundary));
++            Query.Skip(0);
++        }
++
++        // Avoid overflow for an unbounded practical page size.
++        Query.Take(Request.Take == int.MaxValue ? int.MaxValue : Request.Take + 1);
++    }
++
++    private BaseCriteria BuildSeekCriteria(object?[] values)
++    {
++        var nullsHigh = Query.Dialect().ServerType is nameof(ServerType.Postgres) or
++            nameof(ServerType.Oracle) or nameof(ServerType.Firebird);
++        BaseCriteria? seek = null;
++        BaseCriteria? equal = null;
++        for (var i = 0; i < keysetSort!.Count; i++)
++        {
++            var column = new Criteria(keysetSort[i].Field, keysetExpressions![i]);
++            var descending = keysetSort[i].Descending;
++            var nullsFirst = descending == nullsHigh;
++            BaseCriteria? after;
++            BaseCriteria same;
++            if (values[i] == null)
++            {
++                after = nullsFirst ? column.IsNotNull() : null;
++                same = column.IsNull();
++            }
++            else
++            {
++                var value = new ValueCriteria(values[i]);
++                after = descending ? column < value : column > value;
++                if (!nullsFirst)
++                    after |= column.IsNull();
++                same = column == value;
++            }
++
++            // No greater value exists after a NULL that sorts last, but later
++            // sort columns can still advance within the group of NULLs.
++            if (after is not null)
++                seek |= equal & after;
++            equal &= same;
++        }
++        return seek ?? new Criteria("1 = 0");
++    }
++
++    private protected bool ProcessKeysetRow()
++    {
++        if (keysetSort == null || keysetRowsRead++ < Request.Take)
++            return true;
++
++        keysetHasMore = true;
++        return false;
++    }
++
++    private protected void CompleteKeysetPagination()
++    {
++        Response.NextPageToken = null;
++        if (keysetSort == null)
++            return;
++
++        Response.Take = Request.Take;
++        Response.Skip = 0;
++        if (Response.Entities.Count == 0 || (!keysetHasMore && Response.Entities.Count <= Request.Take))
++            return;
++
++        if (Response.Entities.Count > Request.Take)
++            Response.Entities.RemoveRange(Request.Take, Response.Entities.Count - Request.Take);
++        var last = Response.Entities[^1];
++        Response.NextPageToken = ListPageToken.Write(keysetFingerprint!,
++            keysetSort.Select(x => x.Field.AsObject(last)).ToArray());
++    }
++
++    private static JToken Canonicalize(JToken token)
++    {
++        if (token is JObject obj)
++            return new JObject(obj.Properties().OrderBy(x => x.Name, StringComparer.Ordinal)
++                .Select(x => new JProperty(x.Name, Canonicalize(x.Value))));
++        if (token is JArray array)
++            return new JArray(array.Select(Canonicalize));
++        return token.DeepClone();
++    }
++}
+diff --git a/src/services/RequestHandlers/List/ListRequestHandlerBase.cs b/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
+index 3c0c783ac..68ed08d67 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
+@@ -16,7 +16,7 @@ namespace Serenity.Services;
+ /// </remarks>
+ /// <param name="context">Request context</param>
+ /// <exception cref="ArgumentNullException"><paramref name="context"/> is <c>null</c>.</exception>
+-public abstract class ListRequestHandlerBase<TRow, TListRequest, TListResponse>(IRequestContext context) : IListRequestHandler
++public abstract partial class ListRequestHandlerBase<TRow, TListRequest, TListResponse>(IRequestContext context) : IListRequestHandler
+     where TRow : class, IRow, new()
+     where TListRequest : ListRequest
+     where TListResponse : ListResponse<TRow>, new()
+diff --git a/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetTests.cs b/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetTests.cs
+new file mode 100644
+index 000000000..ded4cffc4
+--- /dev/null
++++ b/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetTests.cs
+@@ -0,0 +1,460 @@
++using System.Threading;
++
++namespace Serenity.Services;
++
++public class ListRequestHandlerKeysetTests
++{
++    private static string Sql(string text) => text?.Replace("[", "").Replace("]", "").Replace("\"", "").Replace("`", "");
++
++    private static IRequestContext Context() => new NullRequestContext().WithPermissions(_ => true);
++    private static ListRequest Request(string? token = null) => new() { Take = 1, ExcludeTotalCount = true, PageToken = token };
++
++    private static async Task<(ListResponse<TRow> Response, SqlQuery Query)> Run<TRow>(bool async,
++        MockDbConnection connection, ListRequest request) where TRow : class, IRow, new()
++    {
++        if (async)
++        {
++            var handler = new ListRequestHandlerAsync<TRow>(Context());
++            return (await handler.ListAsync(connection, request, TestContext.Current.CancellationToken), handler.Query);
++        }
++        else
++        {
++            var handler = new ListRequestHandler<TRow>(Context());
++            return (handler.List(connection, request), handler.Query);
++        }
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Pages_Overfetch_Trim_And_Use_Last_Returned_Row(bool async)
++    {
++        using var connection = new MockDbConnection().InterceptExecuteReader(args =>
++            args.ToMockReader(new { ID = 10, Name = "same" }, new { ID = 20, Name = "same" }));
++        var first = await Run<IdNameRow>(async, connection, Request());
++        Assert.Equal(2, first.Query.Take());
++        Assert.Equal(1, first.Response.Take);
++        Assert.Equal(0, first.Response.Skip);
++        Assert.Equal(10, Assert.Single(first.Response.Entities).ID);
++        Assert.Matches("^[A-Za-z0-9_-]+$", first.Response.NextPageToken!);
++        Assert.Equal(new[] { "T0.Name", "T0.ID" }, ((ISqlQuery)first.Query).OrderBy.Select(Sql));
++
++        connection.InterceptExecuteReader(args => args.ToMockReader(new { ID = 20, Name = "same" }));
++        var second = await Run<IdNameRow>(!async, connection, Request(first.Response.NextPageToken));
++        Assert.Null(second.Response.NextPageToken);
++        Assert.Equal(20, Assert.Single(second.Response.Entities).ID);
++        Assert.Equal(1, second.Response.Take);
++        Assert.Equal(0, second.Response.Skip);
++        Assert.Contains("T0.Name > @", Sql(((ISqlQuery)second.Query).Where));
++        Assert.Contains("T0.Name = @", Sql(((ISqlQuery)second.Query).Where));
++        Assert.Contains("T0.ID > @", Sql(((ISqlQuery)second.Query).Where));
++        Assert.Contains(10, second.Query.Params.Values);
++        Assert.DoesNotContain(20, second.Query.Params.Values);
++        Assert.DoesNotContain("same", Sql(((ISqlQuery)second.Query).Where));
++
++        connection.InterceptExecuteReader(_ => new MockDbDataReader());
++        var empty = await Run<IdNameRow>(async, connection, Request(first.Response.NextPageToken));
++        Assert.Empty(empty.Response.Entities);
++        Assert.Null(empty.Response.NextPageToken);
++    }
++
++    public static IEnumerable<object[]> InvalidRequests()
++    {
++        foreach (var async in new[] { false, true })
++            foreach (var kind in new[] { "Take", "Skip", "Distinct", "EmptyDistinct", "Sort", "Criteria",
++                "Equality", "ContainsText", "ContainsField", "IncludeDeleted", "Corrupt", "Malformed", "Empty" })
++                yield return [async, kind];
++    }
++
++    [Theory]
++    [MemberData(nameof(InvalidRequests))]
++    public async Task Rejects_Invalid_Or_Replayed_Tokens(bool async, string kind)
++    {
++        using var connection = new MockDbConnection().InterceptExecuteReader(args =>
++            args.ToMockReader(new { ID = 1, Name = "A" }, new { ID = 2, Name = "B" }));
++        var first = await Run<IdNameRow>(async, connection, Request());
++        var request = Request(first.Response.NextPageToken);
++        switch (kind)
++        {
++            case "Take": request.Take = 0; break;
++            case "Skip": request.Skip = 1; break;
++            case "Distinct": request.DistinctFields = [new("Name")]; break;
++            case "EmptyDistinct": request.DistinctFields = []; break;
++            case "Sort": request.Sort = [new("Name", true)]; break;
++            case "Criteria": request.Criteria = new Criteria("ID") > 0; break;
++            case "Equality": request.EqualityFilter = new() { ["Name"] = "A" }; break;
++            case "ContainsText": request.ContainsText = "A"; break;
++            case "ContainsField": request.ContainsField = "NoSuchField"; break;
++            case "IncludeDeleted": request.IncludeDeleted = true; break;
++            case "Corrupt":
++                var token = request.PageToken!;
++                request.PageToken = token[..40] + (token[40] == 'A' ? "B" : "A") + token[41..];
++                break;
++            case "Malformed": request.PageToken = "not a token"; break;
++            case "Empty": request.PageToken = ""; break;
++        }
++        await Assert.ThrowsAsync<ValidationError>(() => Run<IdNameRow>(async, connection, request));
++        Assert.Single(connection.ExecuteReaderCalls);
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Ineligible_First_Pages_Remain_Offset_Pages(bool async)
++    {
++        using var connection = new MockDbConnection().InterceptExecuteReader(_ => new MockDbDataReader());
++        foreach (var request in new[] { new ListRequest(), new ListRequest { Take = -1 },
++            new ListRequest { Take = 2, Skip = 1 }, new ListRequest { Take = 2, DistinctFields = [] },
++            new ListRequest { Take = 2, DistinctFields = [new("Name")] } })
++        {
++            var page = await Run<IdNameRow>(async, connection, request);
++            Assert.Null(page.Response.NextPageToken);
++            Assert.Equal(request.Take, page.Query.Take());
++        }
++        var noId = await Run<NoIdRow>(async, connection, Request());
++        Assert.Null(noId.Response.NextPageToken);
++        await Assert.ThrowsAsync<ValidationError>(() => Run<NoIdRow>(async, connection, Request("anything")));
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Selects_Excluded_Sort_And_Id_Columns(bool async)
++    {
++        using var connection = new MockDbConnection().InterceptExecuteReader(args =>
++            args.ToMockReader(new { ID = 1, Name = "A" }, new { ID = 2, Name = "B" }));
++        var request = Request();
++        request.ColumnSelection = ColumnSelection.KeyOnly;
++        request.ExcludeColumns = ["Name", "ID"];
++        var page = await Run<IdNameRow>(async, connection, request);
++        Assert.Equal("A", Assert.Single(page.Response.Entities).Name);
++        Assert.NotNull(page.Response.NextPageToken);
++        Assert.Equal(2, ((ISqlQueryExtensible)page.Query).Columns.Count);
++    }
++
++    public static IEnumerable<object[]> NullOrderCases()
++    {
++        foreach (var dialect in new ISqlDialect[] { SqlServer2012Dialect.Instance, MySqlDialect.Instance,
++            SqliteDialect.Instance, PostgresDialect.Instance, OracleDialect.Instance, FirebirdDialect.Instance })
++            foreach (var descending in new[] { false, true })
++                foreach (var isNull in new[] { false, true })
++                    foreach (var async in new[] { false, true })
++                        yield return [dialect.ServerType, descending, isNull, async];
++    }
++
++    [Theory]
++    [MemberData(nameof(NullOrderCases))]
++    public async Task Seek_Respects_Dialect_Null_Order(string server, bool descending, bool isNull, bool async)
++    {
++        var dialect = new ISqlDialect[] { SqlServer2012Dialect.Instance, MySqlDialect.Instance,
++            SqliteDialect.Instance, PostgresDialect.Instance, OracleDialect.Instance, FirebirdDialect.Instance }
++            .Single(x => x.ServerType == server);
++        using var connection = new MockDbConnection { Dialect = dialect };
++        connection.InterceptExecuteReader(args => args.ToMockReader(
++            new { ID = 1, Name = isNull ? null : "A" }, new { ID = 2, Name = "B" }));
++        var request = Request();
++        request.Sort = [new("Name", descending)];
++        var first = await Run<IdNameRow>(async, connection, request);
++        request.PageToken = first.Response.NextPageToken;
++        var second = await Run<IdNameRow>(async, connection, request);
++        var where = Sql(((ISqlQuery)second.Query).Where!);
++        var nullsFirst = descending == (server is "Postgres" or "Oracle" or "Firebird");
++        if (isNull)
++        {
++            Assert.Equal(nullsFirst, where.Contains("T0.Name IS NOT NULL"));
++            Assert.Contains("T0.Name IS NULL", where);
++            Assert.DoesNotContain("T0.Name = @", where);
++        }
++        else
++        {
++            Assert.Equal(!nullsFirst, where.Contains("T0.Name IS NULL"));
++            Assert.Contains("T0.Name " + (descending ? "<" : ">") + " @", where);
++            Assert.Contains("T0.Name = @", where);
++            Assert.Contains("A", second.Query.Params.Values);
++        }
++        Assert.Contains("T0.ID > @", where);
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Total_Count_Does_Not_Include_Seek_Filter(bool async)
++    {
++        using var connection = new MockDbConnection { Dialect = SqliteDialect.Instance };
++        connection.InterceptExecuteScalar(_ => 42).InterceptExecuteReader(args => args.ToMockReader(
++            new { ID = 1, Name = "A" }, new { ID = 2, Name = "A" }));
++        var request = Request();
++        request.ExcludeTotalCount = false;
++        request.EqualityFilter = new() { ["Name"] = "A" };
++        var first = await Run<IdNameRow>(async, connection, request);
++        request.PageToken = first.Response.NextPageToken;
++        var second = await Run<IdNameRow>(async, connection, request);
++        Assert.Equal(42, first.Response.TotalCount);
++        Assert.Equal(42, second.Response.TotalCount);
++        var countSql = Sql(connection.ExecuteScalarCalls.Last().CommandText);
++        Assert.Contains("T0.Name = @", countSql);
++        Assert.DoesNotContain("T0.ID >", countSql);
++        Assert.DoesNotContain("T0.Name >", countSql);
++        Assert.Equal(second.Query.ToString(), second.Query.Clone().ToString());
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Explicit_Id_Sort_Is_Not_Appended_Again(bool async)
++    {
++        using var connection = new MockDbConnection().InterceptExecuteReader(args => args.ToMockReader(
++            new { ID = 3, Name = "A" }, new { ID = 2, Name = "B" }));
++        var request = Request();
++        request.Sort = [new("ID", true)];
++        var first = await Run<IdNameRow>(async, connection, request);
++        request.PageToken = first.Response.NextPageToken;
++        var second = await Run<IdNameRow>(async, connection, request);
++        Assert.Equal("T0.ID DESC", Sql(Assert.Single(((ISqlQuery)second.Query).OrderBy)));
++        Assert.Contains("T0.ID < @", Sql(((ISqlQuery)second.Query).Where));
++    }
++
++    private class NativeHandler() : SeededHandler<IdNameRow>([new() { ID = 1, Name = "A" }, new() { ID = 2, Name = "B" }])
++    {
++        protected override SortBy[] GetNativeSort() => [new("Name", true), new("ID", true)];
++    }
++
++    [Fact]
++    public void Native_First_Page_Order_Is_Preserved_Verbatim_And_Handler_State_Is_Reset()
++    {
++        using var connection = new MockDbConnection();
++        var handler = new NativeHandler();
++        var first = handler.List(connection, Request());
++        var expected = ((ISqlQuery)handler.Query).OrderBy.ToArray();
++        Assert.Equal(new[] { "T0.Name DESC", "T0.ID DESC" }, expected.Select(Sql));
++        var second = handler.List(connection, Request(first.NextPageToken));
++        Assert.Equal(expected, ((ISqlQuery)handler.Query).OrderBy);
++        var inactive = handler.List(connection, new ListRequest());
++        Assert.Null(inactive.NextPageToken);
++        Assert.Equal(expected, ((ISqlQuery)handler.Query).OrderBy);
++        Assert.Null(((ISqlQuery)handler.Query).Where);
++        Assert.Equal(0, handler.Query.Take());
++    }
++
++    private class ProcessingHandler() : ListRequestHandler<IdNameRow>(Context())
++    {
++        public int Processed;
++        protected override IdNameRow ProcessEntity(IdNameRow row) { Processed++; return row; }
++        protected override void OnAfterExecuteQuery() => Assert.Single(Response.Entities);
++    }
++
++    private class ProcessingAsyncHandler() : ListRequestHandlerAsync<IdNameRow>(Context())
++    {
++        public int Processed;
++        protected override IdNameRow ProcessEntity(IdNameRow row) { Processed++; return row; }
++        protected override Task OnAfterExecuteQueryAsync(CancellationToken cancellationToken)
++        {
++            Assert.Single(Response.Entities);
++            return Task.CompletedTask;
++        }
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Probe_Is_Not_Processed_Or_Exposed_To_After_Query_Behaviors(bool async)
++    {
++        using var connection = new MockDbConnection().InterceptExecuteReader(args => args.ToMockReader(
++            new { ID = 1, Name = "A" }, new { ID = 2, Name = "B" }));
++        if (async)
++        {
++            var handler = new ProcessingAsyncHandler();
++            Assert.NotNull((await handler.ListAsync(connection, Request(), TestContext.Current.CancellationToken)).NextPageToken);
++            Assert.Equal(1, handler.Processed);
++        }
++        else
++        {
++            var handler = new ProcessingHandler();
++            Assert.NotNull(handler.List(connection, Request()).NextPageToken);
++            Assert.Equal(1, handler.Processed);
++        }
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Equivalent_Sort_And_Reordered_Equality_Filters_Can_Resume(bool async)
++    {
++        using var connection = new MockDbConnection().InterceptExecuteReader(args => args.ToMockReader(
++            new { ID = 1, Name = "A" }, new { ID = 2, Name = "B" }));
++        var request = Request();
++        request.EqualityFilter = new() { ["Name"] = "A", ["ID"] = 1 };
++        var first = await Run<IdNameRow>(async, connection, request);
++        request.PageToken = first.Response.NextPageToken;
++        request.EqualityFilter = new() { ["ID"] = 1L, ["Name"] = "A" };
++        request.Sort = [new(" Name "), new(" ID ")];
++        request.Take = 10;
++        var second = await Run<IdNameRow>(async, connection, request);
++        Assert.Equal(10, second.Response.Take);
++        Assert.Null(second.Response.NextPageToken);
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Maximum_Take_Does_Not_Overflow(bool async)
++    {
++        using var connection = new MockDbConnection().InterceptExecuteReader(_ => new MockDbDataReader());
++        var request = Request();
++        request.Take = int.MaxValue;
++        var result = await Run<IdNameRow>(async, connection, request);
++        Assert.Equal(int.MaxValue, result.Query.Take());
++        Assert.Equal(int.MaxValue, result.Response.Take);
++        Assert.Null(result.Response.NextPageToken);
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Mixed_Directions_Use_Lexicographic_Seek(bool async)
++    {
++        using var connection = new MockDbConnection();
++        var rows = new TypedRow[] { new() { ID = 10, Text = "group", Decimal = 12.50m }, new() { ID = 11 } };
++        var request = Request();
++        request.Sort = [new("Text"), new("Decimal", true)];
++        SqlQuery query;
++        if (async)
++        {
++            var handler = new SeededAsyncHandler<TypedRow>(rows);
++            request.PageToken = (await handler.ListAsync(connection, request, TestContext.Current.CancellationToken)).NextPageToken;
++            await handler.ListAsync(connection, request, TestContext.Current.CancellationToken);
++            query = handler.Query;
++        }
++        else
++        {
++            var handler = new SeededHandler<TypedRow>(rows);
++            request.PageToken = handler.List(connection, request).NextPageToken;
++            handler.List(connection, request);
++            query = handler.Query;
++        }
++        Assert.Equal(new[] { "T0.Text", "T0.Decimal DESC", "T0.ID" }, ((ISqlQuery)query).OrderBy.Select(Sql));
++        Assert.Equal("(((T0.Text > @p1) OR ((T0.Text = @p2) AND ((T0.Decimal < @p3) OR T0.Decimal IS NULL))) OR " +
++            "(((T0.Text = @p4) AND (T0.Decimal = @p5)) AND (T0.ID > @p6)))", Sql(((ISqlQuery)query).Where));
++        Assert.Equal(new object[] { "group", "group", 12.50m, "group", 12.50m, 10 }, query.Params.Values);
++    }
++
++    private class NoIdRow : Row<NoIdRow.RowFields>
++    {
++        public string Name { get => fields.Name[this]; set => fields.Name[this] = value; }
++        public class RowFields : RowFieldsBase { public StringField Name = null!; }
++    }
++
++    private class SeededHandler<TRow>(TRow[] rows) : ListRequestHandler<TRow>(Context()) where TRow : class, IRow, new()
++    {
++        protected override void ExecuteQuery() => Response.Entities.AddRange(rows);
++    }
++
++    private class SeededAsyncHandler<TRow>(TRow[] rows) : ListRequestHandlerAsync<TRow>(Context()) where TRow : class, IRow, new()
++    {
++        protected override Task ExecuteQueryAsync(CancellationToken cancellationToken)
++        {
++            Response.Entities.AddRange(rows);
++            return Task.CompletedTask;
++        }
++    }
++
++    private class MappedHandler() : SeededHandler<IdNameRow>([new() { ID = 1, Name = "mapped" }, new() { ID = 2, Name = "probe" }])
++    {
++        protected override string MapFieldExpression(IField field, SqlQuery query) =>
++            field.Name == "Name" ? "COALESCE(T0.Name, 'fallback')" : null;
++    }
++
++    [Fact]
++    public void Mapped_Expressions_Are_Used_For_Selection_Order_And_Seek()
++    {
++        using var connection = new MockDbConnection();
++        var handler = new MappedHandler();
++        var request = Request();
++        request.ColumnSelection = ColumnSelection.IdOnly;
++        var first = handler.List(connection, request);
++        request.PageToken = first.NextPageToken;
++        handler.List(connection, request);
++        Assert.Contains("COALESCE(T0.Name, 'fallback')", ((ISqlQuery)handler.Query).OrderBy);
++        Assert.Contains("COALESCE(T0.Name, 'fallback') > @", ((ISqlQuery)handler.Query).Where);
++        Assert.Contains("mapped", handler.Query.Params.Values);
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Boundary_Values_Retain_Their_Types_And_Precision(bool async)
++    {
++        var row = new TypedRow
++        {
++            ID = 123,
++            Date = new DateTime(638799999999999999, DateTimeKind.Utc),
++            Offset = new DateTimeOffset(638799999999999999, TimeSpan.FromMinutes(345)),
++            Guid = Guid.NewGuid(),
++            Decimal = 1234567890.1234567890123456789m,
++            Double = Math.BitIncrement(0.1d),
++            Single = MathF.BitIncrement(0.1f),
++            Boolean = true,
++            Enum = DayOfWeek.Wednesday,
++            Text = "a\0雪😀",
++            Null = null
++        };
++        using var connection = new MockDbConnection();
++        var request = Request();
++        request.Sort = TypedRow.Fields.Select(x => new SortBy(x.Name)).ToArray();
++        SqlQuery query;
++        if (async)
++        {
++            var handler = new SeededAsyncHandler<TypedRow>([row, new()]);
++            request.PageToken = (await handler.ListAsync(connection, request, TestContext.Current.CancellationToken)).NextPageToken;
++            await handler.ListAsync(connection, request, TestContext.Current.CancellationToken);
++            query = handler.Query;
++        }
++        else
++        {
++            var handler = new SeededHandler<TypedRow>([row, new()]);
++            request.PageToken = handler.List(connection, request).NextPageToken;
++            handler.List(connection, request);
++            query = handler.Query;
++        }
++        foreach (var field in TypedRow.Fields)
++        {
++            var expected = field.AsObject(row);
++            if (expected == null)
++                continue;
++            Assert.Contains(query.Params.Values, actual => actual?.GetType() == expected.GetType() && Equals(expected, actual));
++        }
++        Assert.Equal(row.Date.Value.ToBinary(), query.Params.Values.OfType<DateTime>().First().ToBinary());
++        Assert.Equal(row.Offset.Value.Offset, query.Params.Values.OfType<DateTimeOffset>().First().Offset);
++        Assert.Equal(decimal.GetBits(row.Decimal.Value), decimal.GetBits(query.Params.Values.OfType<decimal>().First()));
++    }
++
++    private class TypedRow : Row<TypedRow.RowFields>, IIdRow
++    {
++        [IdProperty]
++        public int? ID { get => fields.ID[this]; set => fields.ID[this] = value; }
++        public DateTime? Date { get => fields.Date[this]; set => fields.Date[this] = value; }
++        public DateTimeOffset? Offset { get => fields.Offset[this]; set => fields.Offset[this] = value; }
++        public Guid? Guid { get => fields.Guid[this]; set => fields.Guid[this] = value; }
++        public decimal? Decimal { get => fields.Decimal[this]; set => fields.Decimal[this] = value; }
++        public double? Double { get => fields.Double[this]; set => fields.Double[this] = value; }
++        public float? Single { get => fields.Single[this]; set => fields.Single[this] = value; }
++        public bool? Boolean { get => fields.Boolean[this]; set => fields.Boolean[this] = value; }
++        public DayOfWeek? Enum { get => fields.Enum[this]; set => fields.Enum[this] = value; }
++        public string Text { get => fields.Text[this]; set => fields.Text[this] = value; }
++        public string Null { get => fields.Null[this]; set => fields.Null[this] = value; }
++        public class RowFields : RowFieldsBase
++        {
++            public Int32Field ID = null!;
++            public DateTimeField Date = null!;
++            public DateTimeOffsetField Offset = null!;
++            public GuidField Guid = null!;
++            public DecimalField Decimal = null!;
++            public DoubleField Double = null!;
++            public SingleField Single = null!;
++            public BooleanField Boolean = null!;
++            public EnumField<DayOfWeek> Enum = null!;
++            public StringField Text = null!;
++            public StringField Null = null!;
++        }
++    }
++}

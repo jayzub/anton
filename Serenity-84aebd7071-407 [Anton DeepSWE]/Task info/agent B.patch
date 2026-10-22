@@ -1,0 +1,2911 @@
+diff --git a/packages/corelib/dist/index.d.ts b/packages/corelib/dist/index.d.ts
+index ebaa79f7b..a64c1e01c 100644
+--- a/packages/corelib/dist/index.d.ts
++++ b/packages/corelib/dist/index.d.ts
+@@ -1537,6 +1537,8 @@ export interface ListRequest extends ServiceRequest {
+ 	Skip?: number;
+ 	/** Maximum number of records to take (page size). Omit or 0 for server default. */
+ 	Take?: number;
++	/** Continuation token for server-side keyset pagination. */
++	PageToken?: string;
+ 	/** Sort expressions, e.g. `["Name ASC", "Age DESC"]`. */
+ 	Sort?: string[];
+ 	/** Quick-search text applied across searchable fields (or {@link ContainsField} when specified). */
+@@ -1579,6 +1581,8 @@ export interface ListResponse<TEntity> extends ServiceResponse {
+ 	Skip?: number;
+ 	/** Echo of `Take` from the request. */
+ 	Take?: number;
++	/** Continuation token for the next page when additional rows exist. */
++	NextPageToken?: string;
+ }
+ /**
+  * Request DTO for `Retrieve` handlers (single-entity fetch).
+diff --git a/packages/corelib/src/base/servicetypes.ts b/packages/corelib/src/base/servicetypes.ts
+index ad343acb7..cb4c2a031 100644
+--- a/packages/corelib/src/base/servicetypes.ts
++++ b/packages/corelib/src/base/servicetypes.ts
+@@ -128,6 +128,8 @@ export interface ListRequest extends ServiceRequest {
+     Skip?: number;
+     /** Maximum number of records to take (page size). Omit or 0 for server default. */
+     Take?: number;
++    /** Continuation token for server-side keyset pagination. */
++    PageToken?: string;
+     /** Sort expressions, e.g. `["Name ASC", "Age DESC"]`. */
+     Sort?: string[];
+     /** Quick-search text applied across searchable fields (or {@link ContainsField} when specified). */
+@@ -171,6 +173,8 @@ export interface ListResponse<TEntity> extends ServiceResponse {
+     Skip?: number;
+     /** Echo of `Take` from the request. */
+     Take?: number;
++    /** Continuation token for the next page when additional rows exist. */
++    NextPageToken?: string;
+ }
+ 
+ /**
+diff --git a/serene/tests/Serene.Tests/Services/ListKeysetPaginationSqliteTests.cs b/serene/tests/Serene.Tests/Services/ListKeysetPaginationSqliteTests.cs
+new file mode 100644
+index 000000000..2c7d579f7
+--- /dev/null
++++ b/serene/tests/Serene.Tests/Services/ListKeysetPaginationSqliteTests.cs
+@@ -0,0 +1,291 @@
++using Microsoft.Data.Sqlite;
++
++namespace Serene.Tests.Services;
++
++public class ListKeysetPaginationSqliteTests
++{
++    public enum ItemState
++    {
++        Draft = 1,
++        Published = 2,
++        Archived = 3
++    }
++
++    [TableName("SqliteKeysetItems")]
++    private class SqliteKeysetRow : Row<SqliteKeysetRow.RowFields>, IIdRow, INameRow, IIsActiveDeletedRow
++    {
++        [IdProperty]
++        public int? Id { get => fields.Id[this]; set => fields.Id[this] = value; }
++
++        [NameProperty, QuickSearch]
++        public string? Name { get => fields.Name[this]; set => fields.Name[this] = value; }
++
++        public int? Rank { get => fields.Rank[this]; set => fields.Rank[this] = value; }
++
++        public DateTime? EventTime { get => fields.EventTime[this]; set => fields.EventTime[this] = value; }
++
++        public DateTimeOffset? EventOffset { get => fields.EventOffset[this]; set => fields.EventOffset[this] = value; }
++
++        public Guid? ExternalId { get => fields.ExternalId[this]; set => fields.ExternalId[this] = value; }
++
++        public decimal? Price { get => fields.Price[this]; set => fields.Price[this] = value; }
++
++        public double? Score { get => fields.Score[this]; set => fields.Score[this] = value; }
++
++        public bool? Featured { get => fields.Featured[this]; set => fields.Featured[this] = value; }
++
++        public ItemState? State { get => fields.State[this]; set => fields.State[this] = value; }
++
++        public short? IsActive { get => fields.IsActive[this]; set => fields.IsActive[this] = value; }
++
++        Int16Field IIsActiveRow.IsActiveField => fields.IsActive;
++
++        public class RowFields : RowFieldsBase
++        {
++            public Int32Field Id = null!;
++            public StringField Name = null!;
++            public Int32Field Rank = null!;
++            public DateTimeField EventTime = null!;
++            public DateTimeOffsetField EventOffset = null!;
++            public GuidField ExternalId = null!;
++            public DecimalField Price = null!;
++            public DoubleField Score = null!;
++            public BooleanField Featured = null!;
++            public EnumField<ItemState> State = null!;
++            public Int16Field IsActive = null!;
++        }
++    }
++
++    [TableName("SqliteGuidItems")]
++    private class SqliteGuidKeyRow : Row<SqliteGuidKeyRow.RowFields>, IIdRow
++    {
++        [IdProperty]
++        public Guid? Id { get => fields.Id[this]; set => fields.Id[this] = value; }
++
++        public string? GroupKey { get => fields.GroupKey[this]; set => fields.GroupKey[this] = value; }
++
++        public class RowFields : RowFieldsBase
++        {
++            public GuidField Id = null!;
++            public StringField GroupKey = null!;
++        }
++    }
++
++    private sealed class SqliteLocalizationBehavior : BaseListBehavior, IListMapFieldExpressionBehavior
++    {
++        public override void OnPrepareQuery(IListRequestHandler handler, SqlQuery query)
++        {
++            query.LeftJoin("SqliteKeysetItemsLang", new Alias("jLoc"),
++                new Criteria("jLoc.ItemId = T0.Id AND jLoc.CultureId = 'de'"));
++        }
++
++        public string? MapFieldExpression(IListRequestHandler handler, SqlQuery query, IField field)
++        {
++            if (field.Name == nameof(SqliteKeysetRow.Name))
++                return "COALESCE(jLoc.Name, T0.Name)";
++            return null;
++        }
++    }
++
++    private static IRequestContext CreateContext(IBehaviorProvider? behaviors = null) =>
++        new NullRequestContext(behaviors).WithPermissions(_ => true);
++
++    private static IDbConnection OpenInMemorySqlite()
++    {
++        var raw = new SqliteConnection("Data Source=:memory:");
++        raw.Open();
++        using var cmd = raw.CreateCommand();
++        cmd.CommandText = """
++            CREATE TABLE SqliteKeysetItems (
++                Id INTEGER PRIMARY KEY,
++                Name TEXT NULL,
++                Rank INTEGER NULL,
++                EventTime TEXT NULL,
++                EventOffset TEXT NULL,
++                ExternalId TEXT NULL,
++                Price TEXT NULL,
++                Score REAL NULL,
++                Featured INTEGER NULL,
++                State INTEGER NULL,
++                IsActive INTEGER NOT NULL DEFAULT 1
++            );
++            CREATE TABLE SqliteKeysetItemsLang (
++                LangId INTEGER PRIMARY KEY AUTOINCREMENT,
++                ItemId INTEGER NOT NULL,
++                CultureId TEXT NOT NULL,
++                Name TEXT NULL
++            );
++            CREATE TABLE SqliteGuidItems (
++                Id TEXT PRIMARY KEY,
++                GroupKey TEXT NULL
++            );
++            """;
++        cmd.ExecuteNonQuery();
++        return new WrappedConnection(raw, SqliteDialect.Instance);
++    }
++
++    [Fact]
++    public async Task Live_Sqlite_EndToEnd_MultiColumn_Nulls_Types_Localization_And_TotalCount()
++    {
++        using var conn = OpenInMemorySqlite();
++        var ctx = CreateContext();
++
++        var baseTime = new DateTime(2026, 3, 15, 10, 20, 30, DateTimeKind.Utc).AddTicks(1234567);
++        var baseOffset = new DateTimeOffset(new DateTime(2026, 3, 15, 10, 20, 30).AddTicks(2345678), TimeSpan.FromHours(2));
++
++        // Insert 9 active rows + 1 inactive row with NULLs, ties, sub-ms ticks, Guids, decimals, floats, bools, enums
++        int?[] ranks = [null, null, 10, 10, 10, 20, 20, 30, 30, 99];
++        string?[] names = [null, "Alpha", null, "Alpha", "Beta", null, "Gamma", "Delta", "Epsilon", "Deleted"];
++
++        for (var i = 0; i < 10; i++)
++        {
++            SqlHelper.ExecuteNonQuery(conn, """
++                INSERT INTO SqliteKeysetItems
++                    (Id, Name, Rank, EventTime, EventOffset, ExternalId, Price, Score, Featured, State, IsActive)
++                VALUES
++                    (@id, @name, @rank, @et, @eo, @gid, @price, @score, @feat, @state, @active)
++                """,
++                new Dictionary<string, object?>
++                {
++                    ["@id"] = i + 1,
++                    ["@name"] = names[i],
++                    ["@rank"] = ranks[i],
++                    ["@et"] = baseTime.AddTicks(i * 3), // sub-millisecond 300ns steps!
++                    ["@eo"] = baseOffset.AddTicks(i * 5),
++                    ["@gid"] = Guid.Parse($"00000000-0000-0000-0000-0000000000{(i + 1):D2}"),
++                    ["@price"] = 100.12345678m + i * 0.00000001m,
++                    ["@score"] = Math.PI + i * 1e-12,
++                    ["@feat"] = i % 2 == 0,
++                    ["@state"] = (int)(ItemState)((i % 3) + 1),
++                    ["@active"] = i == 9 ? (short)-1 : (short)1
++                });
++        }
++
++        // Verify ALL single-type & multi-column ASC/DESC sorts against full unpaginated SQLite query!
++        SortBy[][] sortsToVerify =
++        [
++            [new(nameof(SqliteKeysetRow.Rank), false), new(nameof(SqliteKeysetRow.Name), false)],
++            [new(nameof(SqliteKeysetRow.Rank), true), new(nameof(SqliteKeysetRow.Name), false)],
++            [new(nameof(SqliteKeysetRow.Rank), false), new(nameof(SqliteKeysetRow.Name), true)],
++            [new(nameof(SqliteKeysetRow.Rank), true), new(nameof(SqliteKeysetRow.Name), true)],
++            [new(nameof(SqliteKeysetRow.EventTime), false)],
++            [new(nameof(SqliteKeysetRow.EventTime), true)],
++            [new(nameof(SqliteKeysetRow.EventOffset), false)],
++            [new(nameof(SqliteKeysetRow.ExternalId), false)],
++            [new(nameof(SqliteKeysetRow.Price), false)],
++            [new(nameof(SqliteKeysetRow.Score), false)],
++            [new(nameof(SqliteKeysetRow.Featured), false), new(nameof(SqliteKeysetRow.State), true)]
++        ];
++
++        foreach (var sort in sortsToVerify)
++        {
++            var fullUnpaged = new ListRequestHandler<SqliteKeysetRow>(ctx).List(conn, new ListRequest
++            {
++                Sort = sort
++            });
++            var expectedIds = fullUnpaged.Entities.Select(x => x.Id!.Value).ToList();
++            Assert.Equal(9, expectedIds.Count);
++
++            // Walk sync with Take = 2 AND check TotalCount == 9 on EVERY single page!
++            var pagedSyncIds = new List<int>();
++            string? tok = null;
++            do
++            {
++                var page = new ListRequestHandler<SqliteKeysetRow>(ctx).List(conn, new ListRequest
++                {
++                    Take = 2,
++                    Sort = sort,
++                    ColumnSelection = ColumnSelection.KeyOnly,
++                    PageToken = tok
++                });
++                Assert.Equal(9, page.TotalCount);
++                Assert.Equal(2, page.Take);
++                Assert.Equal(0, page.Skip);
++                pagedSyncIds.AddRange(page.Entities.Select(x => x.Id!.Value));
++                tok = page.NextPageToken;
++            }
++            while (tok is not null);
++
++            Assert.Equal(expectedIds, pagedSyncIds);
++
++            // Walk async with Take = 1 (strictest single-row boundary test!)
++            var pagedAsyncIds = new List<int>();
++            tok = null;
++            do
++            {
++                var page = await new ListRequestHandlerAsync<SqliteKeysetRow>(ctx).ListAsync(conn, new ListRequest
++                {
++                    Take = 1,
++                    Sort = sort,
++                    ExcludeColumns = [nameof(SqliteKeysetRow.Name), nameof(SqliteKeysetRow.Rank)],
++                    PageToken = tok
++                }, TestContext.Current.CancellationToken);
++                Assert.Equal(9, page.TotalCount);
++                Assert.Equal(1, page.Take);
++                Assert.Equal(0, page.Skip);
++                pagedAsyncIds.AddRange(page.Entities.Select(x => x.Id!.Value));
++                tok = page.NextPageToken;
++            }
++            while (tok is not null);
++
++            Assert.Equal(expectedIds, pagedAsyncIds);
++        }
++
++        // Verify Guid primary key tiebreaker in live SQLite
++        var guids = new[]
++        {
++            Guid.Parse("30000000-0000-0000-0000-000000000003"),
++            Guid.Parse("10000000-0000-0000-0000-000000000001"),
++            Guid.Parse("20000000-0000-0000-0000-000000000002")
++        };
++        foreach (var g in guids)
++        {
++            SqlHelper.ExecuteNonQuery(conn,
++                "INSERT INTO SqliteGuidItems (Id, GroupKey) VALUES (@id, @grp)",
++                new Dictionary<string, object?> { ["@id"] = g, ["@grp"] = "Same" });
++        }
++
++        var gPage1 = new ListRequestHandler<SqliteGuidKeyRow>(ctx).List(conn, new ListRequest
++        {
++            Take = 2,
++            Sort = [new SortBy(nameof(SqliteGuidKeyRow.GroupKey))]
++        });
++        var gPage2 = new ListRequestHandler<SqliteGuidKeyRow>(ctx).List(conn, new ListRequest
++        {
++            Take = 2,
++            Sort = [new SortBy(nameof(SqliteGuidKeyRow.GroupKey))],
++            PageToken = gPage1.NextPageToken
++        });
++        Assert.Equal([guids[1], guids[2]], gPage1.Entities.Select(x => x.Id!.Value));
++        Assert.Equal([guids[0]], gPage2.Entities.Select(x => x.Id!.Value));
++        Assert.Null(gPage2.NextPageToken);
++
++        // Verify LEFT JOIN + COALESCE localization rewrite in live SQLite
++        SqlHelper.ExecuteNonQuery(conn, """
++            INSERT INTO SqliteKeysetItemsLang (ItemId, CultureId, Name) VALUES
++            (8, 'de', '000_Erste'),
++            (4, 'de', 'ZZZ_Letzte');
++            """);
++        var locCtx = CreateContext(new MockBehaviorProvider((_, _, _) => new object[] { new SqliteLocalizationBehavior() }));
++        var unpagedLoc = new ListRequestHandler<SqliteKeysetRow>(locCtx)
++            .List(conn, new ListRequest { Sort = [new SortBy(nameof(SqliteKeysetRow.Name))] })
++            .Entities.Select(x => x.Id!.Value).ToList();
++
++        var pagedLoc = new List<int>();
++        string? locTok = null;
++        do
++        {
++            var r = await new ListRequestHandlerAsync<SqliteKeysetRow>(locCtx).ListAsync(conn, new ListRequest
++            {
++                Take = 2,
++                Sort = [new SortBy(nameof(SqliteKeysetRow.Name))],
++                PageToken = locTok
++            }, TestContext.Current.CancellationToken);
++            pagedLoc.AddRange(r.Entities.Select(x => x.Id!.Value));
++            locTok = r.NextPageToken;
++        }
++        while (locTok is not null);
++
++        Assert.Equal(unpagedLoc, pagedLoc);
++    }
++}
+diff --git a/src/codegenerator/CodeGeneration/Model/BuiltinTSTypes.gen.cs b/src/codegenerator/CodeGeneration/Model/BuiltinTSTypes.gen.cs
+index ea4bab167..31ede40f3 100644
+--- a/src/codegenerator/CodeGeneration/Model/BuiltinTSTypes.gen.cs
++++ b/src/codegenerator/CodeGeneration/Model/BuiltinTSTypes.gen.cs
+@@ -156,8 +156,8 @@ public class BuiltinTSTypes
+                 new() { Name = "IValidateRequired", Fields = [ new() { Name = "[Symbol.typeInfo]", Type = "InterfaceTypeInfo", IsStatic = true, Value = "Serenity." } ] },
+                 new() { Name = "LayoutTimer", IsInterface = true },
+                 new() { Name = "LazyLoadHelper", IsInterface = true },
+-                new() { Name = "ListRequest", IsInterface = true, Interfaces = [ "ServiceRequest" ], Fields = [ new() { Name = "Skip", Type = "number" }, new() { Name = "Take", Type = "number" }, new() { Name = "Sort", Type = "string[]" }, new() { Name = "ContainsText", Type = "string" }, new() { Name = "ContainsField", Type = "string" }, new() { Name = "Criteria", Type = "any[]" }, new() { Name = "EqualityFilter" }, new() { Name = "IncludeDeleted", Type = "boolean" }, new() { Name = "ExcludeTotalCount", Type = "boolean" }, new() { Name = "ColumnSelection", Type = "ColumnSelection" }, new() { Name = "IncludeColumns", Type = "string[]" }, new() { Name = "ExcludeColumns", Type = "string[]" }, new() { Name = "ExportColumns", Type = "string[]" }, new() { Name = "DistinctFields", Type = "string[]" }, new() { Name = "Localize", Type = "string" } ] },
+-                new() { Name = "ListResponse", IsInterface = true, Interfaces = [ "ServiceResponse" ], Fields = [ new() { Name = "Entities", Type = "TEntity[]" }, new() { Name = "Values", Type = "any[]" }, new() { Name = "TotalCount", Type = "number" }, new() { Name = "Skip", Type = "number" }, new() { Name = "Take", Type = "number" } ], GenericParameters = [ new() { Name = "TEntity" } ] },
++                new() { Name = "ListRequest", IsInterface = true, Interfaces = [ "ServiceRequest" ], Fields = [ new() { Name = "Skip", Type = "number" }, new() { Name = "Take", Type = "number" }, new() { Name = "PageToken", Type = "string" }, new() { Name = "Sort", Type = "string[]" }, new() { Name = "ContainsText", Type = "string" }, new() { Name = "ContainsField", Type = "string" }, new() { Name = "Criteria", Type = "any[]" }, new() { Name = "EqualityFilter" }, new() { Name = "IncludeDeleted", Type = "boolean" }, new() { Name = "ExcludeTotalCount", Type = "boolean" }, new() { Name = "ColumnSelection", Type = "ColumnSelection" }, new() { Name = "IncludeColumns", Type = "string[]" }, new() { Name = "ExcludeColumns", Type = "string[]" }, new() { Name = "ExportColumns", Type = "string[]" }, new() { Name = "DistinctFields", Type = "string[]" }, new() { Name = "Localize", Type = "string" } ] },
++                new() { Name = "ListResponse", IsInterface = true, Interfaces = [ "ServiceResponse" ], Fields = [ new() { Name = "Entities", Type = "TEntity[]" }, new() { Name = "Values", Type = "any[]" }, new() { Name = "TotalCount", Type = "number" }, new() { Name = "Skip", Type = "number" }, new() { Name = "Take", Type = "number" }, new() { Name = "NextPageToken", Type = "string" } ], GenericParameters = [ new() { Name = "TEntity" } ] },
+                 new() { Name = "Locale", IsInterface = true, Interfaces = [ "NumberFormat", "DateFormat" ], Fields = [ new() { Name = "stringCompare" }, new() { Name = "toUpper" } ] },
+                 new() { Name = "Lookup", IsInterface = true, Fields = [ new() { Name = "items", Type = "TItem[]" }, new() { Name = "itemById", Type = "{}" }, new() { Name = "idField", Type = "string" }, new() { Name = "parentIdField", Type = "string" }, new() { Name = "textField", Type = "string" } ], GenericParameters = [ new() { Name = "TItem" } ] },
+                 new() { Name = "LookupEditor", BaseType = "LookupEditorBase", Fields = [ new() { Name = "[Symbol.typeInfo]", Type = "EditorTypeInfo", IsStatic = true, Value = "Serenity." } ], GenericParameters = [ new() { Name = "P", Extends = "LookupEditorOptions", Default = "LookupEditorOptions" } ] },
+diff --git a/src/services/Data/FluentSql/SqlQuery.cs b/src/services/Data/FluentSql/SqlQuery.cs
+index 543143bf4..a788c7063 100644
+--- a/src/services/Data/FluentSql/SqlQuery.cs
++++ b/src/services/Data/FluentSql/SqlQuery.cs
+@@ -26,6 +26,7 @@ public partial class SqlQuery : QueryWithParams, ISqlQuery, IFilterableQuery, IG
+     private int skip;
+     private int take;
+     private StringBuilder? where;
++    internal string? seekFilter;
+     private int intoIndex = -1;
+     private List<object> into = [];
+     private SqlQuery? unionQuery;
+diff --git a/src/services/Data/FluentSql/SqlQuery_Clone.cs b/src/services/Data/FluentSql/SqlQuery_Clone.cs
+index 3fbca24ca..fd18e6826 100644
+--- a/src/services/Data/FluentSql/SqlQuery_Clone.cs
++++ b/src/services/Data/FluentSql/SqlQuery_Clone.cs
+@@ -27,7 +27,8 @@ public partial class SqlQuery
+             forJson = forJson,
+             unionQuery = unionQuery,
+             unionType = unionType,
+-            nextAutoParam = nextAutoParam
++            nextAutoParam = nextAutoParam,
++            seekFilter = seekFilter
+         };
+ 
+         Column s;
+diff --git a/src/services/Data/FluentSql/SqlQuery_ToString.cs b/src/services/Data/FluentSql/SqlQuery_ToString.cs
+index 64e860b7b..7c621bbd5 100644
+--- a/src/services/Data/FluentSql/SqlQuery_ToString.cs
++++ b/src/services/Data/FluentSql/SqlQuery_ToString.cs
+@@ -26,7 +26,9 @@ public partial class SqlQuery
+     int ISqlQuery.Take => take;
+     ISqlQuery? ISqlQuery.UnionQuery => unionQuery;
+     SqlUnionType ISqlQuery.UnionType => unionType;
+-    string? ISqlQuery.Where => where?.ToString();
++    string? ISqlQuery.Where => seekFilter == null
++        ? where?.ToString()
++        : (where == null || where.Length == 0 ? seekFilter : where + " AND " + seekFilter);
+ 
+     /// <summary>
+     ///   Formats SQL Query as string. If paging is used and skip requested, multiple queries 
+@@ -62,7 +64,8 @@ public partial class SqlQuery
+ 
+         var orderBy = query.OrderBy.ToArray();
+ 
+-        string? extraWhere = null;
++        var baseWhere = query is SqlQuery sqlQuery ? sqlQuery.where?.ToString() : query.Where;
++        string? extraWhere = (query as SqlQuery)?.seekFilter;
+ 
+         bool useSkipKeyword = skip > 0 && dialect.CanUseSkipKeyword;
+         bool useOffset = (skip > 0 || (take > 0 && !dialect.CanUseSkipKeyword && dialect.UseRowNum)) && 
+@@ -79,16 +82,16 @@ public partial class SqlQuery
+                 sb.Append(query.From);
+             }
+ 
+-            if (extraWhere != null || !string.IsNullOrEmpty(query.Where))
++            if (extraWhere != null || !string.IsNullOrEmpty(baseWhere))
+             {
+                 sb.Append(SqlKeywords.Where);
+ 
+-                if (!string.IsNullOrEmpty(query.Where))
+-                    sb.Append(query.Where);
++                if (!string.IsNullOrEmpty(baseWhere))
++                    sb.Append(baseWhere);
+ 
+                 if (extraWhere != null)
+                 {
+-                    if (!string.IsNullOrEmpty(query.Where))
++                    if (!string.IsNullOrEmpty(baseWhere))
+                         sb.Append(" AND ");
+                     sb.Append(extraWhere);
+                 }
+@@ -257,7 +260,7 @@ public partial class SqlQuery
+                 check.Append(')');
+ 
+                 // determine this statement as filter for next query
+-                extraWhere = check.ToString();
++                extraWhere = extraWhere == null ? check.ToString() : extraWhere + " AND " + check;
+             }
+         }
+ 
+diff --git a/src/services/Models/ListRequest.cs b/src/services/Models/ListRequest.cs
+index 8b0ba7466..f8a46b172 100644
+--- a/src/services/Models/ListRequest.cs
++++ b/src/services/Models/ListRequest.cs
+@@ -17,6 +17,11 @@ public class ListRequest : ServiceRequest, IIncludeExcludeColumns
+     [JsonConverter(typeof(JsonConverters.NullAsDefaultJsonConverter))]
+     public int Take { get; set; }
+ 
++    /// <summary>
++    /// Optional continuation token for server-side keyset pagination.
++    /// </summary>
++    public string? PageToken { get; set; }
++
+     /// <summary>
+     /// Columns to sort returned records by
+     /// </summary>
+diff --git a/src/services/Models/ListResponse.cs b/src/services/Models/ListResponse.cs
+index 08b479e53..356c290f7 100644
+--- a/src/services/Models/ListResponse.cs
++++ b/src/services/Models/ListResponse.cs
+@@ -31,4 +31,10 @@ public class ListResponse<T> : ServiceResponse, IListResponse
+ 
+     /// <inheritdoc/>
+     public int Take { get; set; }
++
++    /// <summary>
++    /// Continuation token for fetching the next page when keyset pagination is active
++    /// and additional rows exist; otherwise <c>null</c>.
++    /// </summary>
++    public string? NextPageToken { get; set; }
+ }
+\ No newline at end of file
+diff --git a/src/services/RequestHandlers/List/KeysetPaginationHelper.cs b/src/services/RequestHandlers/List/KeysetPaginationHelper.cs
+new file mode 100644
+index 000000000..a91630a20
+--- /dev/null
++++ b/src/services/RequestHandlers/List/KeysetPaginationHelper.cs
+@@ -0,0 +1,931 @@
++using System.Buffers.Text;
++using System.Collections;
++using System.IO;
++using System.Security.Cryptography;
++using System.Text.Json;
++
++namespace Serenity.Services;
++
++internal readonly record struct KeysetSortColumn(Field Field, bool Descending);
++
++internal static class KeysetPaginationHelper
++{
++    private const byte FormatVersion = 1;
++    private const int FingerprintSize = 32;
++    private const int IntegrityTagSize = 16;
++
++    private static ReadOnlySpan<byte> IntegrityDomainPrefix =>
++        "Serenity.KeysetPageToken.v1:"u8;
++
++    private static readonly UTF8Encoding StrictUtf8 = new(
++        encoderShouldEmitUTF8Identifier: false,
++        throwOnInvalidBytes: true);
++
++    private enum ValueTag : byte
++    {
++        Null = 0,
++        BoolFalse = 1,
++        BoolTrue = 2,
++        SByte = 3,
++        Byte = 4,
++        Int16 = 5,
++        UInt16 = 6,
++        Int32 = 7,
++        UInt32 = 8,
++        Int64 = 9,
++        UInt64 = 10,
++        Single = 11,
++        Double = 12,
++        Decimal = 13,
++        Char = 14,
++        StringUtf8 = 15,
++        StringUtf16 = 16,
++        Guid = 17,
++        DateTime = 18,
++        DateTimeOffset = 19,
++        DateOnly = 20,
++        TimeOnly = 21,
++        TimeSpan = 22,
++        ByteArray = 23,
++        Enum = 24
++    }
++
++    public static ValidationError InvalidTokenError(string message = "Invalid page token.") =>
++        new("InvalidPageToken", nameof(ListRequest.PageToken), message);
++
++    public static bool NullsSortFirstInAscending(ISqlDialect dialect)
++    {
++        ArgumentNullException.ThrowIfNull(dialect);
++
++        if (dialect is PostgresDialect or OracleDialect or FirebirdDialect)
++            return false;
++
++        var serverType = dialect.ServerType;
++        if (string.Equals(serverType, nameof(ServerType.Postgres), StringComparison.OrdinalIgnoreCase) ||
++            string.Equals(serverType, "PostgreSQL", StringComparison.OrdinalIgnoreCase) ||
++            string.Equals(serverType, nameof(ServerType.Oracle), StringComparison.OrdinalIgnoreCase) ||
++            string.Equals(serverType, nameof(ServerType.Firebird), StringComparison.OrdinalIgnoreCase))
++        {
++            return false;
++        }
++
++        return true;
++    }
++
++    public static object? ExtractBoundaryValue(Field field, IRow entity)
++    {
++        var value = field.AsObject(entity);
++        if (value is null)
++            return null;
++
++        if (!value.GetType().IsEnum)
++        {
++            var enumType = GetFieldEnumType(field);
++            if (enumType is not null)
++                return Enum.ToObject(enumType, value);
++        }
++
++        return value;
++    }
++
++    private static Type? GetFieldEnumType(Field field)
++    {
++        if (field is IEnumTypeField { EnumType.IsEnum: true } enumField)
++            return enumField.EnumType;
++
++        if (field.ValueType.IsEnum)
++            return field.ValueType;
++
++        if (Nullable.GetUnderlyingType(field.ValueType) is { IsEnum: true } underlyingEnum)
++            return underlyingEnum;
++
++        return null;
++    }
++
++    public static byte[] ComputeRequestFingerprint(
++        Type rowType,
++        ReadOnlySpan<KeysetSortColumn> effectiveSort,
++        ReadOnlySpan<string> resolvedSortExpressions,
++        ListRequest request)
++    {
++        using var ms = new MemoryStream(256);
++        using var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true);
++
++        // 1. Entity row type
++        writer.Write(rowType.FullName ?? rowType.Name);
++
++        // 2. Effective sort order
++        writer.Write(effectiveSort.Length);
++        for (var i = 0; i < effectiveSort.Length; i++)
++        {
++            writer.Write(effectiveSort[i].Field.Name);
++            writer.Write(effectiveSort[i].Descending);
++            writer.Write(resolvedSortExpressions[i]);
++        }
++
++        // 3. Criteria
++        if (request.Criteria is null || request.Criteria.IsEmpty)
++        {
++            writer.Write(false);
++        }
++        else
++        {
++            writer.Write(true);
++            var sb = new StringBuilder();
++            var collector = new FingerprintCriteriaParams();
++            request.Criteria.ToString(sb, collector);
++            writer.Write(sb.ToString());
++            writer.Write(collector.Values.Count);
++            foreach (var val in collector.Values)
++                WriteCanonicalFilterValue(writer, val);
++        }
++
++        // 4. EqualityFilter
++        if (request.EqualityFilter is null || request.EqualityFilter.Count == 0)
++        {
++            writer.Write(0);
++        }
++        else
++        {
++            var keys = new string[request.EqualityFilter.Count];
++            var idx = 0;
++            foreach (var key in request.EqualityFilter.Keys)
++                keys[idx++] = key;
++            Array.Sort(keys, StringComparer.Ordinal);
++
++            writer.Write(keys.Length);
++            foreach (var key in keys)
++            {
++                writer.Write(key);
++                WriteCanonicalFilterValue(writer, request.EqualityFilter[key]);
++            }
++        }
++
++        // 5. ContainsText
++        WriteNullableString(writer, request.ContainsText);
++
++        // 6. ContainsField
++        WriteNullableString(writer, request.ContainsField);
++
++        // 7. IncludeDeleted
++        writer.Write(request.IncludeDeleted);
++
++        writer.Flush();
++        return SHA256.HashData(ms.GetBuffer().AsSpan(0, (int)ms.Length));
++    }
++
++    private static void WriteNullableString(BinaryWriter writer, string? value)
++    {
++        if (value is null)
++        {
++            writer.Write(false);
++            return;
++        }
++
++        writer.Write(true);
++        writer.Write(value);
++    }
++
++    private static void WriteCanonicalFilterValue(BinaryWriter writer, object? value)
++    {
++        if (value is Newtonsoft.Json.Linq.JValue jValue)
++            value = jValue.Value;
++
++        if (value is null || value is DBNull)
++        {
++            writer.Write((byte)0);
++            return;
++        }
++
++        if (value is JsonElement je)
++        {
++            WriteCanonicalJsonElement(writer, je);
++            return;
++        }
++
++        if (value is Newtonsoft.Json.Linq.JArray jArray)
++        {
++            writer.Write((byte)4);
++            writer.Write(jArray.Count);
++            foreach (var item in jArray)
++                WriteCanonicalFilterValue(writer, item);
++            return;
++        }
++
++        if (value is Newtonsoft.Json.Linq.JObject jObject)
++        {
++            var props = jObject.Properties().OrderBy(p => p.Name, StringComparer.Ordinal).ToList();
++            writer.Write((byte)5);
++            writer.Write(props.Count);
++            foreach (var prop in props)
++            {
++                writer.Write(prop.Name);
++                WriteCanonicalFilterValue(writer, prop.Value);
++            }
++            return;
++        }
++
++        if (value is bool b)
++        {
++            writer.Write((byte)1);
++            writer.Write(b);
++            return;
++        }
++
++        if (value is string s)
++        {
++            writer.Write((byte)2);
++            writer.Write(s);
++            return;
++        }
++
++        if (value is Enum)
++        {
++            var underlying = Convert.ChangeType(value, Enum.GetUnderlyingType(value.GetType()), CultureInfo.InvariantCulture);
++            WriteCanonicalNumber(writer, underlying!);
++            return;
++        }
++
++        if (value is sbyte or byte or short or ushort or int or uint or long or ulong or float or double or decimal)
++        {
++            WriteCanonicalNumber(writer, value);
++            return;
++        }
++
++        if (value is DateTime dt)
++        {
++            writer.Write((byte)6);
++            writer.Write(dt.Ticks);
++            writer.Write((byte)dt.Kind);
++            return;
++        }
++
++        if (value is DateTimeOffset dto)
++        {
++            writer.Write((byte)7);
++            writer.Write(dto.Ticks);
++            writer.Write(dto.Offset.Ticks);
++            return;
++        }
++
++        if (value is Guid g)
++        {
++            writer.Write((byte)8);
++            writer.Write(g.ToByteArray());
++            return;
++        }
++
++        if (value is DateOnly d)
++        {
++            writer.Write((byte)9);
++            writer.Write(d.DayNumber);
++            return;
++        }
++
++        if (value is TimeOnly t)
++        {
++            writer.Write((byte)10);
++            writer.Write(t.Ticks);
++            return;
++        }
++
++        if (value is TimeSpan ts)
++        {
++            writer.Write((byte)11);
++            writer.Write(ts.Ticks);
++            return;
++        }
++
++        if (value is byte[] bytes)
++        {
++            writer.Write((byte)12);
++            writer.Write(bytes.Length);
++            writer.Write(bytes);
++            return;
++        }
++
++        if (value is IEnumerable enumerable)
++        {
++            var items = new List<object?>();
++            foreach (var item in enumerable)
++                items.Add(item);
++            writer.Write((byte)4);
++            writer.Write(items.Count);
++            foreach (var item in items)
++                WriteCanonicalFilterValue(writer, item);
++            return;
++        }
++
++        writer.Write((byte)13);
++        writer.Write(value.GetType().FullName ?? string.Empty);
++        writer.Write(Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty);
++    }
++
++    private static void WriteCanonicalJsonElement(BinaryWriter writer, JsonElement element)
++    {
++        switch (element.ValueKind)
++        {
++            case JsonValueKind.Null:
++            case JsonValueKind.Undefined:
++                writer.Write((byte)0);
++                break;
++
++            case JsonValueKind.True:
++                writer.Write((byte)1);
++                writer.Write(true);
++                break;
++
++            case JsonValueKind.False:
++                writer.Write((byte)1);
++                writer.Write(false);
++                break;
++
++            case JsonValueKind.String:
++                writer.Write((byte)2);
++                writer.Write(element.GetString()!);
++                break;
++
++            case JsonValueKind.Number:
++                if (element.TryGetDecimal(out var dec))
++                    WriteCanonicalDecimal(writer, dec);
++                else
++                    WriteCanonicalDouble(writer, element.GetDouble());
++                break;
++
++            case JsonValueKind.Array:
++                writer.Write((byte)4);
++                writer.Write(element.GetArrayLength());
++                foreach (var item in element.EnumerateArray())
++                    WriteCanonicalJsonElement(writer, item);
++                break;
++
++            case JsonValueKind.Object:
++                var props = new List<JsonProperty>();
++                foreach (var prop in element.EnumerateObject())
++                    props.Add(prop);
++                props.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
++                writer.Write((byte)5);
++                writer.Write(props.Count);
++                foreach (var prop in props)
++                {
++                    writer.Write(prop.Name);
++                    WriteCanonicalJsonElement(writer, prop.Value);
++                }
++                break;
++        }
++    }
++
++    private static void WriteCanonicalNumber(BinaryWriter writer, object value)
++    {
++        switch (value)
++        {
++            case decimal dec:
++                WriteCanonicalDecimal(writer, dec);
++                return;
++            case sbyte v:
++                WriteCanonicalDecimal(writer, v);
++                return;
++            case byte v:
++                WriteCanonicalDecimal(writer, v);
++                return;
++            case short v:
++                WriteCanonicalDecimal(writer, v);
++                return;
++            case ushort v:
++                WriteCanonicalDecimal(writer, v);
++                return;
++            case int v:
++                WriteCanonicalDecimal(writer, v);
++                return;
++            case uint v:
++                WriteCanonicalDecimal(writer, v);
++                return;
++            case long v:
++                WriteCanonicalDecimal(writer, v);
++                return;
++            case ulong v:
++                WriteCanonicalDecimal(writer, v);
++                return;
++            case float f when float.IsFinite(f) && TryDoubleToDecimal(f, out var fDec):
++                WriteCanonicalDecimal(writer, fDec);
++                return;
++            case double d when double.IsFinite(d) && TryDoubleToDecimal(d, out var dDec):
++                WriteCanonicalDecimal(writer, dDec);
++                return;
++            case float f2:
++                WriteCanonicalDouble(writer, f2);
++                return;
++            case double d2:
++                WriteCanonicalDouble(writer, d2);
++                return;
++        }
++    }
++
++    private static bool TryDoubleToDecimal(double value, out decimal result)
++    {
++        return decimal.TryParse(
++            value.ToString("R", CultureInfo.InvariantCulture),
++            NumberStyles.Float,
++            CultureInfo.InvariantCulture,
++            out result);
++    }
++
++    private static void WriteCanonicalDecimal(BinaryWriter writer, decimal value)
++    {
++        writer.Write((byte)3);
++        var s = value.ToString(CultureInfo.InvariantCulture);
++        if (s.Contains('.'))
++            s = s.TrimEnd('0').TrimEnd('.');
++        if (s == "-0")
++            s = "0";
++        writer.Write(s);
++    }
++
++    private static void WriteCanonicalDouble(BinaryWriter writer, double value)
++    {
++        writer.Write((byte)14);
++        writer.Write(BitConverter.DoubleToInt64Bits(value));
++    }
++
++    public static string EncodeToken(
++        ReadOnlySpan<byte> requestFingerprint,
++        ReadOnlySpan<KeysetSortColumn> effectiveSort,
++        IRow boundaryEntity)
++    {
++        using var ms = new MemoryStream(128);
++        using (var writer = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
++        {
++            writer.Write(FormatVersion);
++            writer.Write(requestFingerprint);
++            writer.Write(effectiveSort.Length);
++
++            foreach (var col in effectiveSort)
++            {
++                var value = ExtractBoundaryValue(col.Field, boundaryEntity);
++                WriteBoundaryValue(writer, value);
++            }
++        }
++
++        var payloadLength = (int)ms.Length;
++        Span<byte> fullDigest = stackalloc byte[32];
++        ComputeIntegrityHash(ms.GetBuffer().AsSpan(0, payloadLength), fullDigest);
++        ms.Write(fullDigest[..IntegrityTagSize]);
++
++        return Base64Url.EncodeToString(ms.GetBuffer().AsSpan(0, (int)ms.Length));
++    }
++
++    public static object?[] DecodeAndValidateToken(
++        string token,
++        ReadOnlySpan<byte> expectedFingerprint,
++        ReadOnlySpan<KeysetSortColumn> effectiveSort)
++    {
++        if (string.IsNullOrEmpty(token))
++            throw InvalidTokenError();
++
++        // Enforce strict unpadded RFC 4648 Section 5 Base64URL alphabet
++        foreach (var ch in token)
++        {
++            var isValid = (ch >= 'A' && ch <= 'Z') ||
++                          (ch >= 'a' && ch <= 'z') ||
++                          (ch >= '0' && ch <= '9') ||
++                          ch == '-' || ch == '_';
++            if (!isValid)
++                throw InvalidTokenError();
++        }
++
++        byte[] rawBytes;
++        try
++        {
++            rawBytes = Base64Url.DecodeFromChars(token);
++        }
++        catch (FormatException)
++        {
++            throw InvalidTokenError();
++        }
++
++        // Reject any non-canonical unused trailing sextet bit mutations
++        if (!string.Equals(Base64Url.EncodeToString(rawBytes), token, StringComparison.Ordinal))
++            throw InvalidTokenError();
++
++        const int minLength = 1 + FingerprintSize + sizeof(int) + IntegrityTagSize;
++        if (rawBytes.Length < minLength)
++            throw InvalidTokenError();
++
++        var payloadLength = rawBytes.Length - IntegrityTagSize;
++        var payloadSpan = rawBytes.AsSpan(0, payloadLength);
++        var actualTag = rawBytes.AsSpan(payloadLength, IntegrityTagSize);
++
++        Span<byte> computedFullDigest = stackalloc byte[32];
++        ComputeIntegrityHash(payloadSpan, computedFullDigest);
++        if (!CryptographicOperations.FixedTimeEquals(actualTag, computedFullDigest[..IntegrityTagSize]))
++            throw InvalidTokenError();
++
++        try
++        {
++            using var ms = new MemoryStream(rawBytes, 0, payloadLength, writable: false);
++            using var reader = new BinaryReader(ms, Encoding.UTF8, leaveOpen: false);
++
++            var version = reader.ReadByte();
++            if (version != FormatVersion)
++                throw InvalidTokenError();
++
++            var tokenFingerprint = reader.ReadBytes(FingerprintSize);
++            if (tokenFingerprint.Length != FingerprintSize ||
++                !CryptographicOperations.FixedTimeEquals(tokenFingerprint, expectedFingerprint))
++            {
++                throw InvalidTokenError("Page token does not match the current query parameters.");
++            }
++
++            var count = reader.ReadInt32();
++            if (count != effectiveSort.Length)
++                throw InvalidTokenError();
++
++            var values = new object?[count];
++            for (var i = 0; i < count; i++)
++                values[i] = ReadBoundaryValue(reader, effectiveSort[i].Field);
++
++            if (ms.Position != payloadLength)
++                throw InvalidTokenError();
++
++            return values;
++        }
++        catch (ValidationError)
++        {
++            throw;
++        }
++        catch (Exception)
++        {
++            throw InvalidTokenError();
++        }
++    }
++
++    private static void ComputeIntegrityHash(ReadOnlySpan<byte> payload, Span<byte> destination)
++    {
++        using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
++        sha.AppendData(IntegrityDomainPrefix);
++        sha.AppendData(payload);
++        sha.GetHashAndReset(destination);
++    }
++
++    private static void WriteBoundaryValue(BinaryWriter writer, object? value)
++    {
++        if (value is null || value is DBNull)
++        {
++            writer.Write((byte)ValueTag.Null);
++            return;
++        }
++
++        if (value is Enum)
++        {
++            var enumType = value.GetType();
++            var underlying = Convert.ChangeType(value, Enum.GetUnderlyingType(enumType), CultureInfo.InvariantCulture)!;
++            writer.Write((byte)ValueTag.Enum);
++            writer.Write(enumType.AssemblyQualifiedName ?? enumType.FullName ?? string.Empty);
++            WriteBoundaryValue(writer, underlying);
++            return;
++        }
++
++        switch (value)
++        {
++            case bool b:
++                writer.Write((byte)(b ? ValueTag.BoolTrue : ValueTag.BoolFalse));
++                break;
++
++            case sbyte v:
++                writer.Write((byte)ValueTag.SByte);
++                writer.Write(v);
++                break;
++
++            case byte v:
++                writer.Write((byte)ValueTag.Byte);
++                writer.Write(v);
++                break;
++
++            case short v:
++                writer.Write((byte)ValueTag.Int16);
++                writer.Write(v);
++                break;
++
++            case ushort v:
++                writer.Write((byte)ValueTag.UInt16);
++                writer.Write(v);
++                break;
++
++            case int v:
++                writer.Write((byte)ValueTag.Int32);
++                writer.Write(v);
++                break;
++
++            case uint v:
++                writer.Write((byte)ValueTag.UInt32);
++                writer.Write(v);
++                break;
++
++            case long v:
++                writer.Write((byte)ValueTag.Int64);
++                writer.Write(v);
++                break;
++
++            case ulong v:
++                writer.Write((byte)ValueTag.UInt64);
++                writer.Write(v);
++                break;
++
++            case float v:
++                writer.Write((byte)ValueTag.Single);
++                writer.Write(BitConverter.SingleToInt32Bits(v));
++                break;
++
++            case double v:
++                writer.Write((byte)ValueTag.Double);
++                writer.Write(BitConverter.DoubleToInt64Bits(v));
++                break;
++
++            case decimal v:
++                writer.Write((byte)ValueTag.Decimal);
++                var bits = decimal.GetBits(v);
++                writer.Write(bits[0]);
++                writer.Write(bits[1]);
++                writer.Write(bits[2]);
++                writer.Write(bits[3]);
++                break;
++
++            case char v:
++                writer.Write((byte)ValueTag.Char);
++                writer.Write((ushort)v);
++                break;
++
++            case string s:
++                WriteStringValue(writer, s);
++                break;
++
++            case Guid g:
++                writer.Write((byte)ValueTag.Guid);
++                Span<byte> guidBytes = stackalloc byte[16];
++                g.TryWriteBytes(guidBytes);
++                writer.Write(guidBytes);
++                break;
++
++            case DateTime dt:
++                writer.Write((byte)ValueTag.DateTime);
++                writer.Write(dt.Ticks);
++                writer.Write((byte)dt.Kind);
++                break;
++
++            case DateTimeOffset dto:
++                writer.Write((byte)ValueTag.DateTimeOffset);
++                writer.Write(dto.Ticks);
++                writer.Write(dto.Offset.Ticks);
++                break;
++
++            case DateOnly d:
++                writer.Write((byte)ValueTag.DateOnly);
++                writer.Write(d.DayNumber);
++                break;
++
++            case TimeOnly t:
++                writer.Write((byte)ValueTag.TimeOnly);
++                writer.Write(t.Ticks);
++                break;
++
++            case TimeSpan ts:
++                writer.Write((byte)ValueTag.TimeSpan);
++                writer.Write(ts.Ticks);
++                break;
++
++            case byte[] bytes:
++                writer.Write((byte)ValueTag.ByteArray);
++                writer.Write(bytes.Length);
++                writer.Write(bytes);
++                break;
++
++            default:
++                WriteStringValue(writer, Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty);
++                break;
++        }
++    }
++
++    private static void WriteStringValue(BinaryWriter writer, string value)
++    {
++        try
++        {
++            var utf8Bytes = StrictUtf8.GetBytes(value);
++            writer.Write((byte)ValueTag.StringUtf8);
++            writer.Write(utf8Bytes.Length);
++            writer.Write(utf8Bytes);
++        }
++        catch (EncoderFallbackException)
++        {
++            writer.Write((byte)ValueTag.StringUtf16);
++            writer.Write(value.Length);
++            foreach (var ch in value)
++                writer.Write((ushort)ch);
++        }
++    }
++
++    private static object? ReadBoundaryValue(BinaryReader reader, Field field)
++    {
++        var tag = (ValueTag)reader.ReadByte();
++        switch (tag)
++        {
++            case ValueTag.Null:
++                return null;
++
++            case ValueTag.BoolFalse:
++                return false;
++
++            case ValueTag.BoolTrue:
++                return true;
++
++            case ValueTag.SByte:
++                return reader.ReadSByte();
++
++            case ValueTag.Byte:
++                return reader.ReadByte();
++
++            case ValueTag.Int16:
++                return reader.ReadInt16();
++
++            case ValueTag.UInt16:
++                return reader.ReadUInt16();
++
++            case ValueTag.Int32:
++                return reader.ReadInt32();
++
++            case ValueTag.UInt32:
++                return reader.ReadUInt32();
++
++            case ValueTag.Int64:
++                return reader.ReadInt64();
++
++            case ValueTag.UInt64:
++                return reader.ReadUInt64();
++
++            case ValueTag.Single:
++                return BitConverter.Int32BitsToSingle(reader.ReadInt32());
++
++            case ValueTag.Double:
++                return BitConverter.Int64BitsToDouble(reader.ReadInt64());
++
++            case ValueTag.Decimal:
++                return new decimal([
++                    reader.ReadInt32(),
++                    reader.ReadInt32(),
++                    reader.ReadInt32(),
++                    reader.ReadInt32()
++                ]);
++
++            case ValueTag.Char:
++                return (char)reader.ReadUInt16();
++
++            case ValueTag.StringUtf8:
++            {
++                var len = reader.ReadInt32();
++                if (len < 0 || len > reader.BaseStream.Length - reader.BaseStream.Position)
++                    throw InvalidTokenError();
++                var bytes = reader.ReadBytes(len);
++                if (bytes.Length != len)
++                    throw InvalidTokenError();
++                return StrictUtf8.GetString(bytes);
++            }
++
++            case ValueTag.StringUtf16:
++            {
++                var charCount = reader.ReadInt32();
++                if (charCount < 0 || (long)charCount * 2 > reader.BaseStream.Length - reader.BaseStream.Position)
++                    throw InvalidTokenError();
++                var chars = new char[charCount];
++                for (var i = 0; i < charCount; i++)
++                    chars[i] = (char)reader.ReadUInt16();
++                return new string(chars);
++            }
++
++            case ValueTag.Guid:
++            {
++                var guidBytes = reader.ReadBytes(16);
++                if (guidBytes.Length != 16)
++                    throw InvalidTokenError();
++                return new Guid(guidBytes);
++            }
++
++            case ValueTag.DateTime:
++            {
++                var ticks = reader.ReadInt64();
++                var kind = (DateTimeKind)reader.ReadByte();
++                if (kind is not (DateTimeKind.Unspecified or DateTimeKind.Utc or DateTimeKind.Local))
++                    throw InvalidTokenError();
++                return new DateTime(ticks, kind);
++            }
++
++            case ValueTag.DateTimeOffset:
++            {
++                var ticks = reader.ReadInt64();
++                var offsetTicks = reader.ReadInt64();
++                return new DateTimeOffset(ticks, TimeSpan.FromTicks(offsetTicks));
++            }
++
++            case ValueTag.DateOnly:
++                return DateOnly.FromDayNumber(reader.ReadInt32());
++
++            case ValueTag.TimeOnly:
++                return new TimeOnly(reader.ReadInt64());
++
++            case ValueTag.TimeSpan:
++                return TimeSpan.FromTicks(reader.ReadInt64());
++
++            case ValueTag.ByteArray:
++            {
++                var len = reader.ReadInt32();
++                if (len < 0 || len > reader.BaseStream.Length - reader.BaseStream.Position)
++                    throw InvalidTokenError();
++                var bytes = reader.ReadBytes(len);
++                if (bytes.Length != len)
++                    throw InvalidTokenError();
++                return bytes;
++            }
++
++            case ValueTag.Enum:
++            {
++                var typeName = reader.ReadString();
++                var rawUnderlying = ReadBoundaryValue(reader, field) ?? throw InvalidTokenError();
++                var enumType = GetFieldEnumType(field) ??
++                    (!string.IsNullOrEmpty(typeName) ? Type.GetType(typeName, throwOnError: false) : null);
++                if (enumType is null || !enumType.IsEnum)
++                    throw InvalidTokenError();
++                return Enum.ToObject(enumType, rawUnderlying);
++            }
++
++            default:
++                throw InvalidTokenError();
++        }
++    }
++
++    public static BaseCriteria BuildSeekCriteria(
++        SqlQuery query,
++        ISqlDialect dialect,
++        ReadOnlySpan<KeysetSortColumn> effectiveSort,
++        ReadOnlySpan<object?> boundaryValues,
++        Func<Field, SqlQuery, string> getFieldExpression)
++    {
++        var nullsSortFirstInAsc = NullsSortFirstInAscending(dialect);
++        var count = effectiveSort.Length;
++        var columnClauses = new (BaseCriteria? After, BaseCriteria Equal)[count];
++
++        for (var i = 0; i < count; i++)
++        {
++            var col = effectiveSort[i];
++            var expr = getFieldExpression(col.Field, query);
++            var colCriteria = new Criteria(col.Field, expr);
++            var nullsComeFirst = nullsSortFirstInAsc != col.Descending;
++            var boundaryValue = boundaryValues[i];
++
++            if (boundaryValue is null)
++            {
++                var after = nullsComeFirst ? colCriteria.IsNotNull() : null;
++                var equal = colCriteria.IsNull();
++                columnClauses[i] = (after, equal);
++            }
++            else
++            {
++                var param = query.AutoParam();
++                query.AddParam(param.Name, boundaryValue);
++                var paramCriteria = new ParamCriteria(param.Name);
++                var cmpOp = col.Descending ? CriteriaOperator.LT : CriteriaOperator.GT;
++                var strictCmp = new BinaryCriteria(colCriteria, cmpOp, paramCriteria);
++                var after = nullsComeFirst ? strictCmp : (strictCmp | colCriteria.IsNull());
++                var equal = new BinaryCriteria(colCriteria, CriteriaOperator.EQ, paramCriteria);
++                columnClauses[i] = (after, equal);
++            }
++        }
++
++        BaseCriteria? seek = null;
++        for (var i = count - 1; i >= 0; i--)
++        {
++            var (after, equal) = columnClauses[i];
++            if (seek is null)
++                seek = after;
++            else if (after is null)
++                seek = equal & seek;
++            else
++                seek = after | (equal & seek);
++        }
++
++        return seek ?? Criteria.False;
++    }
++
++    private sealed class FingerprintCriteriaParams : IQueryWithParams
++    {
++        private int nextIndex;
++        public List<object?> Values { get; } = [];
++
++        public void AddParam(string name, object? value) => Values.Add(value);
++
++        public void SetParam(string name, object? value) => Values.Add(value);
++
++        public Parameter AutoParam() => new(nextIndex++.IndexParam());
++
++        public IDictionary<string, object?>? Params => null;
++
++        public ISqlDialect Dialect => SqlSettings.DefaultDialect;
++    }
++}
+diff --git a/src/services/RequestHandlers/List/ListRequestHandler.cs b/src/services/RequestHandlers/List/ListRequestHandler.cs
+index ba87f787e..42cfab37a 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandler.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandler.cs
+@@ -128,7 +128,7 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+                         Response.Values!.Add(field.AsObject(clone)!);
+                 }
+                 else
+-                    Response.Entities.Add(clone);
++                    TryAddEntityWithKeysetProbe(clone);
+             });
+         }
+         catch (Exception exception)
+@@ -154,6 +154,7 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+         StateBag.Clear();
+         lookupAccessMode = false;
+         ignoredEqualityFilters = null;
++        ResetKeysetState();
+         Connection = connection ?? throw new ArgumentNullException(nameof(connection));
+         Request = request ?? throw new ArgumentNullException(nameof(request));
+         ValidateRequest();
+@@ -172,20 +173,30 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+         if (DistinctFields != null)
+             Response.Values = [];
+ 
++        InitializeKeysetPagination();
++
+         PrepareQuery(query);
++        FinalizeKeysetPreparation(query);
+ 
+-        if (DistinctFields == null)
++        var isContinuation = keysetBoundaryValues is not null;
++        if (DistinctFields == null && !isContinuation)
+             ApplyKeyOrder(query);
+ 
+-        query.ApplySkipTakeAndCount(request.Skip, request.Take,
++        query.ApplySkipTakeAndCount(request.Skip, GetEffectiveQueryTake(),
+             request.ExcludeTotalCount || DistinctFields != null);
+ 
+         ApplyContainsText(query, request.ContainsText);
+ 
+         if (DistinctFields == null)
+-            ApplySort(query);
++        {
++            if (isContinuation)
++                ApplyKeysetContinuationOrder(query);
++            else
++                ApplySort(query);
++        }
+ 
+         ApplyFilters(query);
++        ApplyKeysetSeekFilter(query);
+ 
+         OnBeforeExecuteQuery();
+ 
+@@ -200,6 +211,7 @@ public class ListRequestHandler<TRow, TListRequest, TListResponse> :
+         }
+ 
+         Response.SetSkipTakeTotal(query);
++        CompleteKeysetPagination();
+ 
+         OnAfterExecuteQuery();
+ 
+diff --git a/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs b/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
+index d4fd52e28..ec1e4ef0b 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandlerAsync.cs
+@@ -128,7 +128,7 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+                         Response.Values!.Add(field.AsObject(clone)!);
+                 }
+                 else
+-                    Response.Entities.Add(clone);
++                    TryAddEntityWithKeysetProbe(clone);
+             }, cancellationToken).ConfigureAwait(false);
+         }
+         catch (Exception exception)
+@@ -156,6 +156,7 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+         StateBag.Clear();
+         lookupAccessMode = false;
+         ignoredEqualityFilters = null;
++        ResetKeysetState();
+         Connection = connection ?? throw new ArgumentNullException(nameof(connection));
+         Request = request ?? throw new ArgumentNullException(nameof(request));
+         await ValidateRequestAsync(cancellationToken).ConfigureAwait(false);
+@@ -174,20 +175,30 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+         if (DistinctFields != null)
+             Response.Values = [];
+ 
++        InitializeKeysetPagination();
++
+         await PrepareQueryAsync(query, cancellationToken).ConfigureAwait(false);
++        FinalizeKeysetPreparation(query);
+ 
+-        if (DistinctFields == null)
++        var isContinuation = keysetBoundaryValues is not null;
++        if (DistinctFields == null && !isContinuation)
+             ApplyKeyOrder(query);
+ 
+-        query.ApplySkipTakeAndCount(request.Skip, request.Take,
++        query.ApplySkipTakeAndCount(request.Skip, GetEffectiveQueryTake(),
+             request.ExcludeTotalCount || DistinctFields != null);
+ 
+         ApplyContainsText(query, request.ContainsText);
+ 
+         if (DistinctFields == null)
+-            ApplySort(query);
++        {
++            if (isContinuation)
++                ApplyKeysetContinuationOrder(query);
++            else
++                ApplySort(query);
++        }
+ 
+         await ApplyFiltersAsync(query, cancellationToken).ConfigureAwait(false);
++        ApplyKeysetSeekFilter(query);
+ 
+         await OnBeforeExecuteQueryAsync(cancellationToken).ConfigureAwait(false);
+ 
+@@ -202,6 +213,7 @@ public class ListRequestHandlerAsync<TRow, TListRequest, TListResponse> :
+         }
+ 
+         Response.SetSkipTakeTotal(query);
++        CompleteKeysetPagination();
+ 
+         await OnAfterExecuteQueryAsync(cancellationToken).ConfigureAwait(false);
+ 
+diff --git a/src/services/RequestHandlers/List/ListRequestHandlerBase.cs b/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
+index 3c0c783ac..cc6476b79 100644
+--- a/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
++++ b/src/services/RequestHandlers/List/ListRequestHandlerBase.cs
+@@ -32,6 +32,12 @@ public abstract class ListRequestHandlerBase<TRow, TListRequest, TListResponse>(
+     /// </summary>
+     protected bool lookupAccessMode;
+ 
++    internal bool keysetPagingActive;
++    internal KeysetSortColumn[]? keysetSortColumns;
++    internal byte[]? keysetRequestFingerprint;
++    internal object?[]? keysetBoundaryValues;
++    internal bool keysetHasMoreRows;
++
+     /// <summary>
+     /// Gets the list of list behaviors.
+     /// </summary>
+@@ -113,6 +119,9 @@ public abstract class ListRequestHandlerBase<TRow, TListRequest, TListResponse>(
+         if (DistinctFields != null)
+             return DistinctFields.Contains(field);
+ 
++        if (keysetPagingActive && IsKeysetField(field))
++            return true;
++
+         var mode = field.MinSelectLevel;
+ 
+         if (mode == SelectLevel.Always)
+@@ -754,6 +763,239 @@ public abstract class ListRequestHandlerBase<TRow, TListRequest, TListResponse>(
+     /// </summary>
+     public IDictionary<string, object?> StateBag { get; } = new Dictionary<string, object?>();
+ 
++    internal void ResetKeysetState()
++    {
++        keysetPagingActive = false;
++        keysetSortColumns = null;
++        keysetRequestFingerprint = null;
++        keysetBoundaryValues = null;
++        keysetHasMoreRows = false;
++    }
++
++    internal void InitializeKeysetPagination()
++    {
++        var hasToken = Request.PageToken is not null;
++        var preconditionsMet = Request.Take > 0 &&
++            Request.Skip == 0 &&
++            Request.DistinctFields == null &&
++            Row is IIdRow;
++
++        if (!preconditionsMet)
++        {
++            if (hasToken)
++                throw KeysetPaginationHelper.InvalidTokenError("Keyset pagination preconditions are not satisfied.");
++            return;
++        }
++
++        keysetPagingActive = true;
++        keysetSortColumns = ResolveEffectiveKeysetSort();
++    }
++
++    internal void FinalizeKeysetPreparation(SqlQuery query)
++    {
++        if (!keysetPagingActive || keysetSortColumns is null)
++            return;
++
++        EnsureKeysetColumnsSelected(query);
++
++        var resolvedExpressions = new string[keysetSortColumns.Length];
++        for (var i = 0; i < keysetSortColumns.Length; i++)
++            resolvedExpressions[i] = ResolveKeysetFieldExpression(keysetSortColumns[i].Field, query);
++
++        keysetRequestFingerprint = KeysetPaginationHelper.ComputeRequestFingerprint(
++            typeof(TRow), keysetSortColumns, resolvedExpressions, Request);
++
++        if (Request.PageToken is not null)
++        {
++            keysetBoundaryValues = KeysetPaginationHelper.DecodeAndValidateToken(
++                Request.PageToken, keysetRequestFingerprint, keysetSortColumns);
++        }
++    }
++
++    internal KeysetSortColumn[] ResolveEffectiveKeysetSort()
++    {
++        var idField = ((IIdRow)Row).GetIdField();
++        var rawSort = Request.Sort is { Length: > 0 } ? Request.Sort : GetNativeSort();
++        var result = new List<KeysetSortColumn>((rawSort?.Length ?? 0) + 1);
++        var seen = new HashSet<Field>();
++
++        if (rawSort is not null)
++        {
++            foreach (var sortBy in rawSort)
++            {
++                if (sortBy is null || string.IsNullOrWhiteSpace(sortBy.Field))
++                    continue;
++
++                var fieldName = sortBy.Field.Trim();
++                var field = Row.FindField(fieldName) ?? Row.FindFieldByPropertyName(fieldName);
++                if (field is null)
++                    continue;
++
++                if (field.Flags.HasFlag(FieldFlags.NotMapped))
++                    continue;
++
++                var sortable = field.GetAttribute<SortableAttribute>();
++                if (sortable is not null && !sortable.Value)
++                    continue;
++
++                if (seen.Add(field))
++                    result.Add(new KeysetSortColumn(field, sortBy.Descending));
++            }
++        }
++
++        if (seen.Add(idField))
++            result.Add(new KeysetSortColumn(idField, Descending: false));
++
++        return [.. result];
++    }
++
++    internal bool IsKeysetField(Field field)
++    {
++        if (keysetSortColumns is null)
++            return false;
++
++        foreach (var col in keysetSortColumns)
++        {
++            if (ReferenceEquals(col.Field, field))
++                return true;
++        }
++
++        return false;
++    }
++
++    internal string ResolveKeysetFieldExpression(Field field, SqlQuery query)
++    {
++        if (MapFieldExpression(field, query) is string mapped)
++        {
++            query.EnsureJoinsInExpression(mapped);
++            return mapped;
++        }
++
++        if (((IGetExpressionByName)query).GetExpression(field.Name) is string selected)
++        {
++            query.EnsureJoinsInExpression(selected);
++            return selected;
++        }
++
++        query.EnsureJoinsInExpression(field.Expression);
++        return field.Expression;
++    }
++
++    internal void EnsureKeysetColumnsSelected(SqlQuery query)
++    {
++        if (!keysetPagingActive || keysetSortColumns is null)
++            return;
++
++        var columns = (IList<SqlQuery.Column>)((ISqlQueryExtensible)query).Columns;
++        foreach (var col in keysetSortColumns)
++        {
++            var existingIndex = -1;
++            for (var i = 0; i < columns.Count; i++)
++            {
++                if (ReferenceEquals(columns[i].IntoField, col.Field) ||
++                    string.Equals(columns[i].ColumnName, col.Field.Name, StringComparison.OrdinalIgnoreCase))
++                {
++                    existingIndex = i;
++                    break;
++                }
++            }
++
++            if (existingIndex < 0)
++            {
++                SelectField(query, col.Field);
++            }
++            else if (MapFieldExpression(col.Field, query) is string mapped &&
++                     !string.Equals(columns[existingIndex].Expression, mapped, StringComparison.Ordinal))
++            {
++                query.EnsureJoinsInExpression(mapped);
++                columns[existingIndex] = new SqlQuery.Column(
++                    mapped, columns[existingIndex].ColumnName, columns[existingIndex].IntoRowIndex, columns[existingIndex].IntoField);
++            }
++        }
++    }
++
++    internal int GetEffectiveQueryTake()
++    {
++        if (!keysetPagingActive)
++            return Request.Take;
++
++        return Request.Take < int.MaxValue ? Request.Take + 1 : int.MaxValue;
++    }
++
++    internal void ApplyKeysetContinuationOrder(SqlQuery query)
++    {
++        if (keysetSortColumns is null)
++            return;
++
++        foreach (var col in keysetSortColumns)
++        {
++            var expr = ResolveKeysetFieldExpression(col.Field, query);
++            query.OrderBy(expr, col.Descending);
++        }
++    }
++
++    internal void ApplyKeysetSeekFilter(SqlQuery query)
++    {
++        if (!keysetPagingActive || keysetBoundaryValues is null || keysetSortColumns is null)
++            return;
++
++        var seekCriteria = KeysetPaginationHelper.BuildSeekCriteria(
++            query,
++            Connection.GetDialect(),
++            keysetSortColumns,
++            keysetBoundaryValues,
++            ResolveKeysetFieldExpression);
++
++        var sb = new StringBuilder();
++        seekCriteria.ToString(sb, query);
++        query.seekFilter = sb.ToString();
++    }
++
++    internal bool TryAddEntityWithKeysetProbe(TRow clone)
++    {
++        if (!keysetPagingActive)
++        {
++            Response.Entities.Add(clone);
++            return true;
++        }
++
++        if (Response.Entities.Count < Request.Take)
++        {
++            Response.Entities.Add(clone);
++            return true;
++        }
++
++        keysetHasMoreRows = true;
++        return false;
++    }
++
++    internal void CompleteKeysetPagination()
++    {
++        if (!keysetPagingActive)
++            return;
++
++        if (Response.Entities.Count > Request.Take)
++        {
++            keysetHasMoreRows = true;
++            Response.Entities.RemoveRange(Request.Take, Response.Entities.Count - Request.Take);
++        }
++
++        Response.Take = Request.Take;
++        if (Request.PageToken is not null)
++            Response.Skip = 0;
++
++        if (keysetHasMoreRows && Response.Entities.Count > 0 && keysetSortColumns is not null && keysetRequestFingerprint is not null)
++        {
++            var boundaryEntity = Response.Entities[^1];
++            Response.NextPageToken = KeysetPaginationHelper.EncodeToken(
++                keysetRequestFingerprint, keysetSortColumns, boundaryEntity);
++        }
++        else
++        {
++            Response.NextPageToken = null;
++        }
++    }
++
+     IRow IListRequestHandler.Row => Row;
+     ListRequest IListRequestHandler.Request => Request;
+     IListResponse IListRequestHandler.Response => Response;
+diff --git a/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetPaginationTests.cs b/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetPaginationTests.cs
+new file mode 100644
+index 000000000..5e9ac9179
+--- /dev/null
++++ b/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetPaginationTests.cs
+@@ -0,0 +1,1106 @@
++using System.Globalization;
++
++namespace Serenity.Services;
++
++public class ListRequestHandlerKeysetPaginationTests
++{
++    public enum PriorityLevel
++    {
++        Low = 1,
++        Medium = 2,
++        High = 3
++    }
++
++    public enum ShortCode : short
++    {
++        Alpha = 10,
++        Beta = 20,
++        Gamma = 30
++    }
++
++    [TableName("KeysetItems")]
++    private class KeysetItemRow : Row<KeysetItemRow.RowFields>, IIdRow, INameRow, IIsActiveDeletedRow
++    {
++        [IdProperty, Identity]
++        public int? Id { get => fields.Id[this]; set => fields.Id[this] = value; }
++
++        [NameProperty, QuickSearch]
++        public string? Name { get => fields.Name[this]; set => fields.Name[this] = value; }
++
++        [QuickSearch]
++        public string? Category { get => fields.Category[this]; set => fields.Category[this] = value; }
++
++        public int? Score { get => fields.Score[this]; set => fields.Score[this] = value; }
++
++        public DateTime? CreatedAt { get => fields.CreatedAt[this]; set => fields.CreatedAt[this] = value; }
++
++        public DateTimeOffset? OccurredAt { get => fields.OccurredAt[this]; set => fields.OccurredAt[this] = value; }
++
++        public Guid? CorrelationId { get => fields.CorrelationId[this]; set => fields.CorrelationId[this] = value; }
++
++        public decimal? Amount { get => fields.Amount[this]; set => fields.Amount[this] = value; }
++
++        public double? Ratio { get => fields.Ratio[this]; set => fields.Ratio[this] = value; }
++
++        public float? Weight { get => fields.Weight[this]; set => fields.Weight[this] = value; }
++
++        public bool? Flag { get => fields.Flag[this]; set => fields.Flag[this] = value; }
++
++        public PriorityLevel? Priority { get => fields.Priority[this]; set => fields.Priority[this] = value; }
++
++        public ShortCode? Code { get => (ShortCode?)fields.Code[this]; set => fields.Code[this] = (short?)value; }
++
++        public short? IsActive { get => fields.IsActive[this]; set => fields.IsActive[this] = value; }
++
++        Int16Field IIsActiveRow.IsActiveField => fields.IsActive;
++
++        public class RowFields : RowFieldsBase
++        {
++            public Int32Field Id = null!;
++            public StringField Name = null!;
++            public StringField Category = null!;
++            public Int32Field Score = null!;
++            public DateTimeField CreatedAt = null!;
++            public DateTimeOffsetField OccurredAt = null!;
++            public GuidField CorrelationId = null!;
++            public DecimalField Amount = null!;
++            public DoubleField Ratio = null!;
++            public SingleField Weight = null!;
++            public BooleanField Flag = null!;
++            public EnumField<PriorityLevel> Priority = null!;
++            public Int16Field Code = null!;
++            public Int16Field IsActive = null!;
++        }
++    }
++
++    [TableName("PlainItems")]
++    private class PlainIdRow : Row<PlainIdRow.RowFields>, IIdRow, INameRow
++    {
++        [IdProperty]
++        public int? Id { get => fields.Id[this]; set => fields.Id[this] = value; }
++
++        [NameProperty, QuickSearch]
++        public string? Name { get => fields.Name[this]; set => fields.Name[this] = value; }
++
++        public class RowFields : RowFieldsBase
++        {
++            public Int32Field Id = null!;
++            public StringField Name = null!;
++        }
++    }
++
++    [TableName("KeylessItems")]
++    private class KeylessRow : Row<KeylessRow.RowFields>, INameRow
++    {
++        [NameProperty]
++        public string? Name { get => fields.Name[this]; set => fields.Name[this] = value; }
++
++        public class RowFields : RowFieldsBase
++        {
++            public StringField Name = null!;
++        }
++    }
++
++    private sealed class CustomFirstPageOrderHandler(IRequestContext context) : ListRequestHandler<PlainIdRow>(context)
++    {
++        protected override void ApplyKeyOrder(SqlQuery query)
++        {
++            query.OrderBy("T0.Name", desc: true);
++        }
++
++        protected override void ApplySort(SqlQuery query)
++        {
++        }
++    }
++
++    private sealed class LocalizationRewriteBehavior : BaseListBehavior, IListMapFieldExpressionBehavior
++    {
++        public override void OnPrepareQuery(IListRequestHandler handler, SqlQuery query)
++        {
++            query.LeftJoin("KeysetItemsLang", new Alias("jLoc"),
++                new Criteria("jLoc.ItemId = T0.Id AND jLoc.CultureId = 'tr'"));
++        }
++
++        public string? MapFieldExpression(IListRequestHandler handler, SqlQuery query, IField field)
++        {
++            if (field.Name == nameof(KeysetItemRow.Name))
++                return "COALESCE(jLoc.Name, T0.Name)";
++            return null;
++        }
++    }
++
++    private sealed class ProbeInspectionBehavior : BaseListBehavior
++    {
++        public List<int> CountsInAfterExecute { get; } = [];
++        public List<int> CountsInReturn { get; } = [];
++
++        public override void OnAfterExecuteQuery(IListRequestHandler handler)
++        {
++            CountsInAfterExecute.Add(handler.Response.Entities.Count);
++        }
++
++        public override void OnReturn(IListRequestHandler handler)
++        {
++            CountsInReturn.Add(handler.Response.Entities.Count);
++        }
++    }
++
++    private static IRequestContext CreateContext(IBehaviorProvider? behaviors = null) =>
++        new NullRequestContext(behaviors).WithPermissions(_ => true);
++
++    private static List<KeysetItemRow> CreateSeedDataset(int activeCount, int deletedCount = 1)
++    {
++        var list = new List<KeysetItemRow>();
++        var total = activeCount + deletedCount;
++        for (var i = 1; i <= total; i++)
++        {
++            list.Add(new KeysetItemRow
++            {
++                Id = i,
++                Name = $"Item {i:D2}",
++                Category = i % 2 == 0 ? "Even" : "Odd",
++                Score = (i % 4) * 10,
++                IsActive = i <= activeCount ? (short)1 : (short)-1
++            });
++        }
++        return list;
++    }
++
++    private static MockDbConnection CreateSimulatedSqlConnection(
++        ISqlDialect dialect,
++        List<KeysetItemRow> rows,
++        Func<KeysetItemRow, string, object?>? customExprEvaluator = null)
++    {
++        var nullsFirstInAsc = dialect is not (PostgresDialect or OracleDialect or FirebirdDialect);
++
++        return new MockDbConnection { Dialect = dialect }
++            .InterceptExecuteScalar(args =>
++            {
++                var whereSql = ExtractTopLevelClause(args.CommandText, "WHERE", ["GROUP BY", "HAVING", "ORDER BY"]);
++                var count = rows.Count(r => whereSql is null || EvaluateSqlWhere(whereSql, r, args.Parameters ?? new Dictionary<string, object?>(), customExprEvaluator));
++                return count;
++            })
++            .InterceptExecuteReader(args =>
++            {
++                var rawSelectSql = args.CommandText.Split(["\n---\n", ";\n"], StringSplitOptions.RemoveEmptyEntries)[0];
++                var take = args.Query?.Take() ?? ParseLimitOrTop(rawSelectSql);
++                var selectSql = rawSelectSql.StartsWith("SELECT * FROM (\n", StringComparison.OrdinalIgnoreCase)
++                    ? rawSelectSql["SELECT * FROM (\n".Length..rawSelectSql.LastIndexOf(") WHERE x__", StringComparison.OrdinalIgnoreCase)]
++                    : rawSelectSql;
++                var whereSql = ExtractTopLevelClause(selectSql, "WHERE", ["GROUP BY", "HAVING", "ORDER BY", "OFFSET", "LIMIT", "FOR XML", "FOR JSON"]);
++                var orderSql = ExtractTopLevelClause(selectSql, "ORDER BY", ["OFFSET", "LIMIT", "FOR XML", "FOR JSON"]);
++
++                IEnumerable<KeysetItemRow> filtered = rows.Where(r =>
++                    whereSql is null || EvaluateSqlWhere(whereSql, r, args.Parameters ?? new Dictionary<string, object?>(), customExprEvaluator));
++
++                if (!string.IsNullOrWhiteSpace(orderSql))
++                {
++                    var specs = SplitTopLevelCommas(orderSql)
++                        .Select(s => s.Trim())
++                        .Select(s => s.EndsWith(" DESC", StringComparison.OrdinalIgnoreCase)
++                            ? (Expr: s[..^5].Trim(), Desc: true)
++                            : (Expr: s, Desc: false))
++                        .ToArray();
++
++                    filtered = filtered.OrderBy(r => r, Comparer<KeysetItemRow>.Create((a, b) =>
++                    {
++                        foreach (var (expr, desc) in specs)
++                        {
++                            var va = EvaluateColumnExpr(a, expr, customExprEvaluator);
++                            var vb = EvaluateColumnExpr(b, expr, customExprEvaluator);
++                            var cmp = CompareSqlValues(va, vb, desc, nullsFirstInAsc);
++                            if (cmp != 0)
++                                return cmp;
++                        }
++                        return 0;
++                    }));
++                }
++
++                if (take > 0)
++                    filtered = filtered.Take(take);
++
++                var aliasMatches = Regex.Matches(selectSql, @"\bAS\s+(?!x__)[""\[\`]?(?<name>\w+)[""\]\`]?", RegexOptions.IgnoreCase);
++                var selectedCols = aliasMatches.Select(m => m.Groups["name"].Value).ToArray();
++                var anonymousItems = filtered.Select(r => (object)new
++                {
++                    Id = r.Id,
++                    Name = customExprEvaluator != null ? customExprEvaluator(r, "COALESCE(jLoc.Name, T0.Name)") : r.Name,
++                    Category = r.Category,
++                    Score = r.Score,
++                    CreatedAt = r.CreatedAt,
++                    OccurredAt = r.OccurredAt,
++                    CorrelationId = r.CorrelationId,
++                    Amount = r.Amount,
++                    Ratio = r.Ratio,
++                    Weight = r.Weight,
++                    Flag = r.Flag,
++                    Priority = (int?)r.Priority,
++                    Code = (short?)r.Code,
++                    IsActive = r.IsActive
++                }).ToArray();
++
++                return anonymousItems.Length == 0 ? new MockDbDataReader() : new MockDbDataReader(selectedCols, anonymousItems);
++            });
++    }
++
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task Paginates_All_Pages_Strictly_With_Probe_OverFetch_And_TotalCount(bool isAsync)
++    {
++        var dataset = CreateSeedDataset(activeCount: 7, deletedCount: 1);
++        using var conn = CreateSimulatedSqlConnection(SqliteDialect.Instance, dataset);
++
++        var probeInspector = new ProbeInspectionBehavior();
++        var ctx = CreateContext(new MockBehaviorProvider((_, _, _) => new object[] { probeInspector }));
++
++        var collectedIds = new List<int>();
++        string? token = null;
++        var pageIndex = 0;
++
++        do
++        {
++            var req = new ListRequest
++            {
++                Take = 3,
++                PageToken = token
++            };
++
++            ListResponse<KeysetItemRow> resp = isAsync
++                ? await new ListRequestHandlerAsync<KeysetItemRow>(ctx).ListAsync(conn, req, TestContext.Current.CancellationToken)
++                : new ListRequestHandler<KeysetItemRow>(ctx).List(conn, req);
++
++            Assert.Equal(3, resp.Take);
++            Assert.Equal(0, resp.Skip);
++            Assert.Equal(7, resp.TotalCount);
++            Assert.True(resp.Entities.Count <= 3);
++
++            if (pageIndex < 2)
++            {
++                Assert.Equal(3, resp.Entities.Count);
++                Assert.NotNull(resp.NextPageToken);
++                Assert.NotEmpty(resp.NextPageToken);
++                Assert.Equal(Uri.EscapeDataString(resp.NextPageToken), resp.NextPageToken);
++            }
++            else
++            {
++                Assert.Single(resp.Entities);
++                Assert.Null(resp.NextPageToken);
++            }
++
++            collectedIds.AddRange(resp.Entities.Select(x => x.Id!.Value));
++            token = resp.NextPageToken;
++            pageIndex++;
++        }
++        while (token is not null);
++
++        Assert.Equal(3, pageIndex);
++        Assert.Equal([1, 2, 3, 4, 5, 6, 7], collectedIds);
++        Assert.Equal([3, 3, 1], probeInspector.CountsInAfterExecute);
++        Assert.Equal([3, 3, 1], probeInspector.CountsInReturn);
++    }
++
++    [Theory]
++    [InlineData(0)]
++    [InlineData(3)]
++    public async Task Final_Page_With_Exact_Multiple_Or_Empty_Result_Returns_Null_NextPageToken(int activeCount)
++    {
++        var dataset = CreateSeedDataset(activeCount: activeCount, deletedCount: 1);
++        using var conn = CreateSimulatedSqlConnection(SqliteDialect.Instance, dataset);
++
++        var ctx = CreateContext();
++        var syncResp = new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest { Take = 3 });
++        var asyncResp = await new ListRequestHandlerAsync<KeysetItemRow>(ctx).ListAsync(
++            conn, new ListRequest { Take = 3 }, TestContext.Current.CancellationToken);
++
++        Assert.Equal(activeCount, syncResp.Entities.Count);
++        Assert.Null(syncResp.NextPageToken);
++        Assert.Equal(activeCount, asyncResp.Entities.Count);
++        Assert.Null(asyncResp.NextPageToken);
++    }
++
++    [Fact]
++    public async Task OverFetches_At_Most_Take_Plus_One_Rows_Only_When_Keyset_Is_Active()
++    {
++        var recordedTakes = new List<int>();
++        using var conn = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                recordedTakes.Add(args.Query.Take());
++                return args.ToMockReader(
++                    new { ID = 1, Name = "A" },
++                    new { ID = 2, Name = "B" },
++                    new { ID = 3, Name = "C" });
++            });
++
++        var ctx = CreateContext();
++        var syncResp = new ListRequestHandler<IdNameRow>(ctx).List(conn, new ListRequest { Take = 2 });
++        Assert.Equal(2, syncResp.Entities.Count);
++        Assert.Equal([1, 2], syncResp.Entities.Select(x => x.ID!.Value));
++        Assert.Equal(2, syncResp.Take);
++        Assert.Equal(0, syncResp.Skip);
++        Assert.NotNull(syncResp.NextPageToken);
++
++        var asyncResp = await new ListRequestHandlerAsync<IdNameRow>(ctx).ListAsync(
++            conn, new ListRequest { Take = 2, PageToken = syncResp.NextPageToken }, TestContext.Current.CancellationToken);
++        Assert.Equal(2, asyncResp.Entities.Count);
++        Assert.Equal(2, asyncResp.Take);
++        Assert.Equal(0, asyncResp.Skip);
++
++        var offsetResp = new ListRequestHandler<IdNameRow>(ctx).List(conn, new ListRequest { Skip = 2, Take = 2 });
++        Assert.Null(offsetResp.NextPageToken);
++
++        var keylessResp = new ListRequestHandler<KeylessRow>(ctx).List(conn, new ListRequest { Take = 2 });
++        Assert.Null(keylessResp.NextPageToken);
++
++        Assert.Equal([3, 3, 2, 2], recordedTakes);
++    }
++
++    [Theory]
++    [InlineData(0, 0, false)]
++    [InlineData(-5, 0, false)]
++    [InlineData(5, 10, false)]
++    [InlineData(5, -1, false)]
++    [InlineData(5, 0, true)]
++    public async Task First_Page_Failing_Preconditions_Leaves_Keyset_Inactive_And_Token_Request_Throws(
++        int take, int skip, bool hasDistinct)
++    {
++        var dataset = CreateSeedDataset(6);
++        using var conn = CreateSimulatedSqlConnection(SqliteDialect.Instance, dataset);
++        var ctx = CreateContext();
++
++        var firstReq = new ListRequest
++        {
++            Take = take,
++            Skip = skip,
++            DistinctFields = hasDistinct ? [new SortBy(nameof(KeysetItemRow.Category))] : null
++        };
++        var r1 = new ListRequestHandler<KeysetItemRow>(ctx).List(conn, firstReq);
++        Assert.Null(r1.NextPageToken);
++
++        var validPage1 = new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest { Take = 2 });
++        Assert.NotNull(validPage1.NextPageToken);
++
++        var badContinuation = new ListRequest
++        {
++            Take = take,
++            Skip = skip,
++            DistinctFields = hasDistinct ? [] : null,
++            PageToken = validPage1.NextPageToken
++        };
++
++        Assert.Throws<ValidationError>(() => new ListRequestHandler<KeysetItemRow>(ctx).List(conn, badContinuation));
++        await Assert.ThrowsAsync<ValidationError>(() =>
++            new ListRequestHandlerAsync<KeysetItemRow>(ctx).ListAsync(conn, badContinuation, TestContext.Current.CancellationToken));
++    }
++
++    [Fact]
++    public async Task Non_IIdRow_With_PageToken_Throws_ValidationError()
++    {
++        var ctx = CreateContext();
++        using var conn = new MockDbConnection().InterceptExecuteReader(_ => new MockDbDataReader());
++
++        Assert.Throws<ValidationError>(() =>
++            new ListRequestHandler<KeylessRow>(ctx).List(conn, new ListRequest { Take = 5, PageToken = "abc" }));
++        await Assert.ThrowsAsync<ValidationError>(() =>
++            new ListRequestHandlerAsync<KeylessRow>(ctx).ListAsync(conn, new ListRequest { Take = 5, PageToken = "abc" },
++                TestContext.Current.CancellationToken));
++    }
++
++    [Theory]
++    [InlineData("")]
++    [InlineData("   ")]
++    [InlineData("not-base64!@#")]
++    [InlineData("abc+def/ghi=")]
++    [InlineData("e30")]
++    [InlineData("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
++    public async Task Malformed_Tokens_Throw_ValidationError(string badToken)
++    {
++        var dataset = CreateSeedDataset(5);
++        using var conn = CreateSimulatedSqlConnection(SqliteDialect.Instance, dataset);
++        var ctx = CreateContext();
++
++        Assert.Throws<ValidationError>(() =>
++            new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest { Take = 2, PageToken = badToken }));
++        await Assert.ThrowsAsync<ValidationError>(() =>
++            new ListRequestHandlerAsync<KeysetItemRow>(ctx).ListAsync(conn, new ListRequest { Take = 2, PageToken = badToken },
++                TestContext.Current.CancellationToken));
++    }
++
++    [Fact]
++    public async Task Every_Single_Character_Corruption_Or_Truncation_Throws_ValidationError()
++    {
++        var dataset = CreateSeedDataset(5);
++        using var conn = CreateSimulatedSqlConnection(SqliteDialect.Instance, dataset);
++        var ctx = CreateContext();
++
++        var page1 = new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest { Take = 2 });
++        var validToken = page1.NextPageToken!;
++        Assert.NotEmpty(validToken);
++
++        for (var i = 0; i < validToken.Length; i++)
++        {
++            var chars = validToken.ToCharArray();
++            chars[i] = chars[i] == 'A' ? 'B' : 'A';
++            var mutated = new string(chars);
++
++            Assert.Throws<ValidationError>(() =>
++                new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest { Take = 2, PageToken = mutated }));
++        }
++
++        Assert.Throws<ValidationError>(() =>
++            new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest { Take = 2, PageToken = validToken[..^1] }));
++        await Assert.ThrowsAsync<ValidationError>(() =>
++            new ListRequestHandlerAsync<KeysetItemRow>(ctx).ListAsync(
++                conn, new ListRequest { Take = 2, PageToken = validToken + "A" }, TestContext.Current.CancellationToken));
++
++        Assert.Throws<ValidationError>(() =>
++            new ListRequestHandler<PlainIdRow>(ctx).List(conn, new ListRequest { Take = 2, PageToken = validToken }));
++    }
++
++    [Fact]
++    public async Task Replay_Against_Changed_Sort_Or_Filters_Throws_ValidationError_While_Equivalent_Succeeds()
++    {
++        var dataset = CreateSeedDataset(6);
++        using var conn = CreateSimulatedSqlConnection(SqliteDialect.Instance, dataset);
++        var ctx = CreateContext();
++
++        var page1 = new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest { Take = 2 });
++        var token = page1.NextPageToken!;
++
++        var eq1 = new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest
++        {
++            Take = 1,
++            ExcludeTotalCount = true,
++            Sort = [],
++            PageToken = token
++        });
++        Assert.Single(eq1.Entities);
++        Assert.Equal(0, eq1.TotalCount);
++
++        var eq2 = new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest
++        {
++            Take = 2,
++            Sort = [new SortBy("Name", false), new SortBy("Id", false)],
++            PageToken = token
++        });
++        Assert.Equal([3, 4], eq2.Entities.Select(x => x.Id!.Value));
++
++        ListRequest[] invalidReplays =
++        [
++            new() { Take = 2, PageToken = token, Sort = [new SortBy("Name", true)] },
++            new() { Take = 2, PageToken = token, Sort = [new SortBy("Score", false)] },
++            new() { Take = 2, PageToken = token, Sort = [new SortBy("Name", false), new SortBy("Id", true)] },
++            new() { Take = 2, PageToken = token, Criteria = new Criteria("Score") > 0 },
++            new() { Take = 2, PageToken = token, EqualityFilter = new Dictionary<string, object?> { ["Category"] = "Odd" } },
++            new() { Take = 2, PageToken = token, ContainsText = "Item" },
++            new() { Take = 2, PageToken = token, ContainsField = "Name" },
++            new() { Take = 2, PageToken = token, IncludeDeleted = true }
++        ];
++
++        foreach (var badReq in invalidReplays)
++        {
++            Assert.Throws<ValidationError>(() => new ListRequestHandler<KeysetItemRow>(ctx).List(conn, badReq));
++            await Assert.ThrowsAsync<ValidationError>(() =>
++                new ListRequestHandlerAsync<KeysetItemRow>(ctx).ListAsync(conn, badReq, TestContext.Current.CancellationToken));
++        }
++
++        using var plainConn = new MockDbConnection()
++            .InterceptExecuteReader(a => a.ToMockReader(new { Id = 1, Name = "A" }, new { Id = 2, Name = "B" }));
++        var plainPage1 = new ListRequestHandler<PlainIdRow>(ctx).List(plainConn, new ListRequest { Take = 1 });
++        Assert.Throws<ValidationError>(() => new ListRequestHandler<PlainIdRow>(ctx).List(plainConn,
++            new ListRequest { Take = 1, PageToken = plainPage1.NextPageToken, IncludeDeleted = true }));
++    }
++
++    [Fact]
++    public void First_Page_Without_Token_Preserves_Custom_Handler_Sort_Ordering_Verbatim()
++    {
++        var recordedSql = new List<string>();
++        using var conn = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                recordedSql.Add(args.CommandText);
++                return args.ToMockReader(
++                    new { Id = 2, Name = "B" },
++                    new { Id = 1, Name = "A" },
++                    new { Id = 3, Name = "C" });
++            });
++
++        var handler = new CustomFirstPageOrderHandler(CreateContext());
++        var firstPage = handler.List(conn, new ListRequest { Take = 2, ExcludeTotalCount = true });
++        Assert.Contains("ORDER BY T0.Name DESC", recordedSql[0]);
++        Assert.DoesNotContain("T0.Id", recordedSql[0].Split("ORDER BY")[1]);
++
++        var nextPage = handler.List(conn, new ListRequest
++        {
++            Take = 2,
++            ExcludeTotalCount = true,
++            PageToken = firstPage.NextPageToken
++        });
++        Assert.Contains($"ORDER BY {PlainIdRow.Fields.Name.Expression}, {PlainIdRow.Fields.Id.Expression}", recordedSql[1]);
++        Assert.Equal(2, nextPage.Entities.Count);
++    }
++
++    [Fact]
++    public void Preserves_Exact_Type_And_Precision_Across_All_Boundary_Types_And_Parameterizes_Values()
++    {
++        var exactDt = new DateTime(2025, 7, 19, 13, 45, 59, DateTimeKind.Utc).AddTicks(9876543);
++        var exactDto = new DateTimeOffset(new DateTime(2025, 7, 19, 13, 45, 59).AddTicks(7654321), TimeSpan.FromHours(3.5));
++        var exactGuid = Guid.Parse("f47ac10b-58cc-4372-a567-0e02b2c3d479");
++        var exactDecimal = 12345678901234567890.12345600m;
++        var exactDouble = Math.PI;
++        var exactFloat = 1.0f / 7.0f;
++        var trickyString = "O'Reilly; DROP TABLE KeysetItems; --";
++
++        IDictionary<string, object?>? capturedParams = null;
++        string? capturedSql = null;
++
++        var callIndex = 0;
++        using var conn = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                callIndex++;
++                if (callIndex == 1)
++                {
++                    return args.ToMockReader(
++                        new
++                        {
++                            Id = 42,
++                            Name = trickyString,
++                            Category = (string?)null,
++                            CreatedAt = exactDt,
++                            OccurredAt = exactDto,
++                            CorrelationId = exactGuid,
++                            Amount = exactDecimal,
++                            Ratio = exactDouble,
++                            Weight = exactFloat,
++                            Flag = true,
++                            Priority = (int)PriorityLevel.High,
++                            Code = (short)ShortCode.Beta
++                        },
++                        new
++                        {
++                            Id = 43,
++                            Name = "ProbeRow",
++                            Category = (string?)null,
++                            CreatedAt = exactDt,
++                            OccurredAt = exactDto,
++                            CorrelationId = exactGuid,
++                            Amount = exactDecimal,
++                            Ratio = exactDouble,
++                            Weight = exactFloat,
++                            Flag = false,
++                            Priority = (int)PriorityLevel.Low,
++                            Code = (short)ShortCode.Alpha
++                        });
++                }
++
++                capturedSql = args.CommandText;
++                capturedParams = args.Parameters;
++                return new MockDbDataReader();
++            });
++
++        var sort = new SortBy[]
++        {
++            new(nameof(KeysetItemRow.CreatedAt)),
++            new(nameof(KeysetItemRow.OccurredAt)),
++            new(nameof(KeysetItemRow.CorrelationId)),
++            new(nameof(KeysetItemRow.Amount)),
++            new(nameof(KeysetItemRow.Ratio)),
++            new(nameof(KeysetItemRow.Weight)),
++            new(nameof(KeysetItemRow.Flag)),
++            new(nameof(KeysetItemRow.Priority)),
++            new(nameof(KeysetItemRow.Code)),
++            new(nameof(KeysetItemRow.Name)),
++            new(nameof(KeysetItemRow.Category))
++        };
++
++        var handler = new ListRequestHandler<KeysetItemRow>(CreateContext());
++        var page1 = handler.List(conn, new ListRequest
++        {
++            Take = 1,
++            IncludeDeleted = true,
++            ExcludeTotalCount = true,
++            Sort = sort
++        });
++        Assert.NotNull(page1.NextPageToken);
++
++        handler.List(conn, new ListRequest
++        {
++            Take = 1,
++            IncludeDeleted = true,
++            ExcludeTotalCount = true,
++            Sort = sort,
++            PageToken = page1.NextPageToken
++        });
++
++        Assert.NotNull(capturedSql);
++        Assert.NotNull(capturedParams);
++
++        Assert.DoesNotContain("O'Reilly", capturedSql);
++        Assert.DoesNotContain("DROP TABLE", capturedSql);
++        Assert.DoesNotContain(exactGuid.ToString(), capturedSql, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains(KeysetItemRow.Fields.Category.Expression + " IS NOT NULL", capturedSql);
++
++        Assert.Equal(11, capturedParams.Count);
++
++        var pDt = Assert.IsType<DateTime>(capturedParams["@p1"]);
++        Assert.Equal(exactDt.Ticks, pDt.Ticks);
++        Assert.Equal(DateTimeKind.Utc, pDt.Kind);
++
++        var pDto = Assert.IsType<DateTimeOffset>(capturedParams["@p2"]);
++        Assert.Equal(exactDto.Ticks, pDto.Ticks);
++        Assert.Equal(exactDto.Offset, pDto.Offset);
++
++        var pGuid = Assert.IsType<Guid>(capturedParams["@p3"]);
++        Assert.Equal(exactGuid, pGuid);
++
++        var pDec = Assert.IsType<decimal>(capturedParams["@p4"]);
++        Assert.Equal(decimal.GetBits(exactDecimal), decimal.GetBits(pDec));
++
++        var pDbl = Assert.IsType<double>(capturedParams["@p5"]);
++        Assert.Equal(BitConverter.DoubleToInt64Bits(exactDouble), BitConverter.DoubleToInt64Bits(pDbl));
++
++        var pFlt = Assert.IsType<float>(capturedParams["@p6"]);
++        Assert.Equal(BitConverter.SingleToInt32Bits(exactFloat), BitConverter.SingleToInt32Bits(pFlt));
++
++        var pBool = Assert.IsType<bool>(capturedParams["@p7"]);
++        Assert.True(pBool);
++
++        var pEnum1 = Assert.IsType<PriorityLevel>(capturedParams["@p8"]);
++        Assert.Equal(PriorityLevel.High, pEnum1);
++
++        var pEnum2 = Assert.IsType<ShortCode>(capturedParams["@p9"]);
++        Assert.Equal(ShortCode.Beta, pEnum2);
++
++        var pStr = Assert.IsType<string>(capturedParams["@p10"]);
++        Assert.Equal(trickyString, pStr);
++
++        var pId = Assert.IsType<int>(capturedParams["@p11"]);
++        Assert.Equal(42, pId);
++    }
++
++    [Fact]
++    public async Task Selects_Sort_And_Tiebreaker_Columns_Under_KeyOnly_And_ExcludeColumns()
++    {
++        var dataset = new List<KeysetItemRow>
++        {
++            new() { Id = 10, Name = "Charlie", Score = 20, IsActive = 1 },
++            new() { Id = 20, Name = "Alpha",   Score = 10, IsActive = 1 },
++            new() { Id = 30, Name = "Alpha",   Score = 10, IsActive = 1 },
++            new() { Id = 40, Name = "Bravo",   Score = 10, IsActive = 1 },
++            new() { Id = 50, Name = "Delta",   Score = 30, IsActive = 1 }
++        };
++        using var conn = CreateSimulatedSqlConnection(SqliteDialect.Instance, dataset);
++
++        var ctx = CreateContext();
++        var idsKeyOnly = new List<int>();
++        string? tok = null;
++        do
++        {
++            var resp = new ListRequestHandler<KeysetItemRow>(ctx).List(conn, new ListRequest
++            {
++                Take = 2,
++                ColumnSelection = ColumnSelection.KeyOnly,
++                ExcludeColumns = [nameof(KeysetItemRow.Score), nameof(KeysetItemRow.Name), nameof(KeysetItemRow.Id)],
++                Sort = [new SortBy(nameof(KeysetItemRow.Score)), new SortBy(nameof(KeysetItemRow.Name))],
++                PageToken = tok
++            });
++            idsKeyOnly.AddRange(resp.Entities.Select(x => x.Id!.Value));
++            tok = resp.NextPageToken;
++        }
++        while (tok is not null);
++
++        Assert.Equal([20, 30, 40, 10, 50], idsKeyOnly);
++
++        var respAsync = await new ListRequestHandlerAsync<KeysetItemRow>(ctx).ListAsync(conn, new ListRequest
++        {
++            Take = 2,
++            ColumnSelection = ColumnSelection.None,
++            Sort = [new SortBy(nameof(KeysetItemRow.Score))]
++        }, TestContext.Current.CancellationToken);
++        Assert.Equal([20, 30], respAsync.Entities.Select(x => x.Id!.Value));
++        Assert.NotNull(respAsync.NextPageToken);
++    }
++
++    [Fact]
++    public async Task Mapped_Field_Expressions_Are_Used_Consistently_In_Select_OrderBy_And_Seek_Filter()
++    {
++        var dataset = new List<KeysetItemRow>
++        {
++            new() { Id = 1, Name = "Zebra",  IsActive = 1 },
++            new() { Id = 2, Name = "Mango",  IsActive = 1 },
++            new() { Id = 3, Name = "Apple",  IsActive = 1 },
++            new() { Id = 4, Name = "Banana", IsActive = 1 }
++        };
++        var trNames = new Dictionary<int, string>
++        {
++            [1] = "02_ZebraTr",
++            [3] = "01_Elma"
++        };
++
++        var capturedSql = new List<string>();
++        using var conn = CreateSimulatedSqlConnection(
++            SqliteDialect.Instance,
++            dataset,
++            (row, expr) => expr == "COALESCE(jLoc.Name, T0.Name)"
++                ? (trNames.TryGetValue(row.Id!.Value, out var tr) ? tr : row.Name)
++                : throw new NotSupportedException(expr));
++
++        var behaviors = new MockBehaviorProvider((_, _, _) => new object[] { new LocalizationRewriteBehavior() });
++        var ctx = CreateContext(behaviors);
++        var handler = new ListRequestHandlerAsync<KeysetItemRow>(ctx);
++
++        var p1 = await handler.ListAsync(conn, new ListRequest
++        {
++            Take = 2,
++            ExcludeTotalCount = true,
++            Sort = [new SortBy(nameof(KeysetItemRow.Name))]
++        }, TestContext.Current.CancellationToken);
++
++        Assert.Equal([3, 1], p1.Entities.Select(x => x.Id!.Value));
++        Assert.Equal(["01_Elma", "02_ZebraTr"], p1.Entities.Select(x => x.Name));
++        Assert.NotNull(p1.NextPageToken);
++
++        var p2 = await handler.ListAsync(conn, new ListRequest
++        {
++            Take = 2,
++            ExcludeTotalCount = true,
++            Sort = [new SortBy(nameof(KeysetItemRow.Name))],
++            PageToken = p1.NextPageToken
++        }, TestContext.Current.CancellationToken);
++
++        Assert.Equal([4, 2], p2.Entities.Select(x => x.Id!.Value));
++        Assert.Equal(["Banana", "Mango"], p2.Entities.Select(x => x.Name));
++        Assert.Null(p2.NextPageToken);
++
++        Assert.Contains("COALESCE(jLoc.Name, T0.Name)", conn.ExecuteReaderCalls[1].CommandText);
++    }
++
++    public static IEnumerable<object[]> AllSixDialects()
++    {
++        yield return [SqlServer2012Dialect.Instance, true];
++        yield return [MySqlDialect.Instance, true];
++        yield return [SqliteDialect.Instance, true];
++        yield return [PostgresDialect.Instance, false];
++        yield return [OracleDialect.Instance, false];
++        yield return [FirebirdDialect.Instance, false];
++    }
++
++    [Theory]
++    [MemberData(nameof(AllSixDialects))]
++    public void Exhaustive_MultiColumn_Null_And_Direction_Simulation_Across_All_Dialects_Parsing_Actual_Sql(
++        ISqlDialect dialect, bool expectedNullsFirstInAsc)
++    {
++        int?[] scores = [null, -10, 10];
++        string?[] names = [null, "A", "B"];
++        var dataset = new List<KeysetItemRow>();
++        var nextId = 1;
++        foreach (var s in scores)
++            foreach (var n in names)
++                for (var dup = 0; dup < 2; dup++)
++                    dataset.Add(new KeysetItemRow { Id = nextId++, Score = s, Name = n, IsActive = 1 });
++
++        using var conn = CreateSimulatedSqlConnection(dialect, dataset);
++        var handler = new ListRequestHandler<KeysetItemRow>(CreateContext());
++
++        bool[][] directionCombos =
++        [
++            [false, false, false],
++            [false, true, false],
++            [true, false, false],
++            [true, true, false],
++            [true, false, true]
++        ];
++
++        foreach (var dirs in directionCombos)
++        {
++            var sort = new SortBy[]
++            {
++                new(nameof(KeysetItemRow.Score), dirs[0]),
++                new(nameof(KeysetItemRow.Name), dirs[1]),
++                new(nameof(KeysetItemRow.Id), dirs[2])
++            };
++
++            var expectedOrder = dataset
++                .OrderBy(r => r, Comparer<KeysetItemRow>.Create((a, b) =>
++                {
++                    var c0 = CompareSqlValues(a.Score, b.Score, dirs[0], expectedNullsFirstInAsc);
++                    if (c0 != 0) return c0;
++                    var c1 = CompareSqlValues(a.Name, b.Name, dirs[1], expectedNullsFirstInAsc);
++                    if (c1 != 0) return c1;
++                    return CompareSqlValues(a.Id, b.Id, dirs[2], expectedNullsFirstInAsc);
++                }))
++                .Select(r => r.Id!.Value)
++                .ToList();
++
++            foreach (var take in new[] { 1, 2, 3, 5, 6, 17, 18, 25 })
++            {
++                var actualIds = new List<int>();
++                string? token = null;
++                var guard = 0;
++
++                do
++                {
++                    var resp = handler.List(conn, new ListRequest
++                    {
++                        Take = take,
++                        IncludeDeleted = true,
++                        ExcludeTotalCount = true,
++                        Sort = sort,
++                        PageToken = token
++                    });
++                    actualIds.AddRange(resp.Entities.Select(x => x.Id!.Value));
++                    token = resp.NextPageToken;
++                    Assert.True(++guard <= dataset.Count + 2, "Pagination did not terminate!");
++                }
++                while (token is not null);
++
++                Assert.Equal(expectedOrder, actualIds);
++            }
++        }
++    }
++
++    // Minimal recursive-descent evaluator over the actual emitted SQL WHERE & ORDER BY clauses
++    private static List<string> SplitTopLevelCommas(string input)
++    {
++        var list = new List<string>();
++        var depth = 0;
++        var start = 0;
++        for (var i = 0; i < input.Length; i++)
++        {
++            if (input[i] == '(') depth++;
++            else if (input[i] == ')') depth--;
++            else if (input[i] == ',' && depth == 0)
++            {
++                list.Add(input[start..i]);
++                start = i + 1;
++            }
++        }
++        list.Add(input[start..]);
++        return list;
++    }
++
++    private static string? ExtractTopLevelClause(string sql, string clauseKeyword, string[] terminators)
++    {
++        var startIdx = FindTopLevelKeyword(sql, clauseKeyword, 0);
++        if (startIdx < 0)
++            return null;
++
++        var contentStart = startIdx + clauseKeyword.Length;
++        var endIdx = sql.Length;
++        foreach (var term in terminators)
++        {
++            var idx = FindTopLevelKeyword(sql, term, contentStart);
++            if (idx >= 0 && idx < endIdx)
++                endIdx = idx;
++        }
++        return sql[contentStart..endIdx].Trim();
++    }
++
++    private static int FindTopLevelKeyword(string sql, string keyword, int fromIndex)
++    {
++        var depth = 0;
++        var inSingleQuote = false;
++        for (var i = fromIndex; i <= sql.Length - keyword.Length; i++)
++        {
++            var c = sql[i];
++            if (c == '\'')
++                inSingleQuote = !inSingleQuote;
++            else if (!inSingleQuote)
++            {
++                if (c == '(') depth++;
++                else if (c == ')') depth = Math.Max(0, depth - 1);
++                else if (depth == 0 &&
++                         (i == 0 || !char.IsLetterOrDigit(sql[i - 1])) &&
++                         string.Compare(sql, i, keyword, 0, keyword.Length, StringComparison.OrdinalIgnoreCase) == 0 &&
++                         (i + keyword.Length == sql.Length || !char.IsLetterOrDigit(sql[i + keyword.Length])))
++                {
++                    return i;
++                }
++            }
++        }
++        return -1;
++    }
++
++    private static int ParseLimitOrTop(string sql)
++    {
++        var m = Regex.Match(sql, @"\b(?:LIMIT|FIRST|FETCH\s+NEXT|TOP)\s+(\d+)\b", RegexOptions.IgnoreCase);
++        if (m.Success)
++            return int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture);
++        m = Regex.Match(sql, @"\bROWNUM\s*<=\s*(\d+)\b", RegexOptions.IgnoreCase);
++        return m.Success ? int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) : 0;
++    }
++
++    private static object? EvaluateColumnExpr(
++        KeysetItemRow row,
++        string expr,
++        Func<KeysetItemRow, string, object?>? customExprEvaluator)
++    {
++        expr = expr.Trim();
++        if (customExprEvaluator != null && expr == "COALESCE(jLoc.Name, T0.Name)")
++            return customExprEvaluator(row, expr);
++
++        var colName = expr.StartsWith("T0.", StringComparison.OrdinalIgnoreCase) ? expr[3..] : expr;
++        colName = SqlSyntax.Unquote(colName);
++        var field = KeysetItemRow.Fields.FindField(colName)!;
++        return field.AsObject(row);
++    }
++
++    private static int CompareSqlValues(object? a, object? b, bool desc, bool nullsFirstInAsc)
++    {
++        var nullsFirst = nullsFirstInAsc != desc;
++        if (a is null && b is null) return 0;
++        if (a is null) return nullsFirst ? -1 : 1;
++        if (b is null) return nullsFirst ? 1 : -1;
++        int cmp;
++        if (a is string sa && b is string sb)
++            cmp = string.CompareOrdinal(sa, sb);
++        else
++            cmp = Comparer<object>.Default.Compare(
++                Convert.ChangeType(a, b.GetType(), CultureInfo.InvariantCulture), b);
++        return desc ? -cmp : cmp;
++    }
++
++    private static bool EvaluateSqlWhere(
++        string expr,
++        KeysetItemRow row,
++        IDictionary<string, object?> parameters,
++        Func<KeysetItemRow, string, object?>? customExprEvaluator)
++    {
++        return EvalSql3VL(expr, row, parameters, customExprEvaluator) == true;
++    }
++
++    private static bool? EvalSql3VL(
++        string expr,
++        KeysetItemRow row,
++        IDictionary<string, object?> parameters,
++        Func<KeysetItemRow, string, object?>? customExprEvaluator)
++    {
++        expr = StripOuterParens(expr.Trim());
++
++        var orPos = SplitTopLevelBinaryLogical(expr, "OR");
++        if (orPos >= 0)
++        {
++            var l = EvalSql3VL(expr[..orPos], row, parameters, customExprEvaluator);
++            var r = EvalSql3VL(expr[(orPos + 2)..], row, parameters, customExprEvaluator);
++            if (l == true || r == true) return true;
++            if (l == false && r == false) return false;
++            return null;
++        }
++
++        var andPos = SplitTopLevelBinaryLogical(expr, "AND");
++        if (andPos >= 0)
++        {
++            var l = EvalSql3VL(expr[..andPos], row, parameters, customExprEvaluator);
++            var r = EvalSql3VL(expr[(andPos + 3)..], row, parameters, customExprEvaluator);
++            if (l == false || r == false) return false;
++            if (l == true && r == true) return true;
++            return null;
++        }
++
++        if (expr.EndsWith(" IS NOT NULL", StringComparison.OrdinalIgnoreCase))
++            return ResolveAtom(expr[..^12].Trim(), row, parameters, customExprEvaluator) is not null;
++
++        if (expr.EndsWith(" IS NULL", StringComparison.OrdinalIgnoreCase))
++            return ResolveAtom(expr[..^8].Trim(), row, parameters, customExprEvaluator) is null;
++
++        foreach (var op in new[] { ">=", "<=", "!=", "<>", "=", ">", "<" })
++        {
++            var idx = FindTopLevelOperator(expr, op);
++            if (idx > 0)
++            {
++                var lv = ResolveAtom(expr[..idx].Trim(), row, parameters, customExprEvaluator);
++                var rv = ResolveAtom(expr[(idx + op.Length)..].Trim(), row, parameters, customExprEvaluator);
++                if (lv is null || rv is null)
++                    return null;
++
++                var cmp = lv is string ls && rv is string rs
++                    ? string.CompareOrdinal(ls, rs)
++                    : Convert.ToDecimal(lv, CultureInfo.InvariantCulture)
++                        .CompareTo(Convert.ToDecimal(rv, CultureInfo.InvariantCulture));
++
++                return op switch
++                {
++                    "=" => cmp == 0,
++                    "!=" or "<>" => cmp != 0,
++                    ">" => cmp > 0,
++                    ">=" => cmp >= 0,
++                    "<" => cmp < 0,
++                    "<=" => cmp <= 0,
++                    _ => throw new NotSupportedException(op)
++                };
++            }
++        }
++
++        throw new NotSupportedException("Unsupported SQL predicate: " + expr);
++    }
++
++    private static string StripOuterParens(string s)
++    {
++        while (s.Length >= 2 && s[0] == '(' && s[^1] == ')')
++        {
++            var depth = 0;
++            var wrapsAll = true;
++            for (var i = 0; i < s.Length; i++)
++            {
++                if (s[i] == '(') depth++;
++                else if (s[i] == ')') depth--;
++                if (depth == 0 && i < s.Length - 1)
++                {
++                    wrapsAll = false;
++                    break;
++                }
++            }
++            if (!wrapsAll)
++                break;
++            s = s[1..^1].Trim();
++        }
++        return s;
++    }
++
++    private static int SplitTopLevelBinaryLogical(string expr, string opKeyword)
++    {
++        var depth = 0;
++        for (var i = 0; i <= expr.Length - opKeyword.Length; i++)
++        {
++            if (expr[i] == '(') depth++;
++            else if (expr[i] == ')') depth--;
++            else if (depth == 0 &&
++                     i > 0 && char.IsWhiteSpace(expr[i - 1]) &&
++                     string.Compare(expr, i, opKeyword, 0, opKeyword.Length, StringComparison.OrdinalIgnoreCase) == 0 &&
++                     i + opKeyword.Length < expr.Length && char.IsWhiteSpace(expr[i + opKeyword.Length]))
++            {
++                return i;
++            }
++        }
++        return -1;
++    }
++
++    private static int FindTopLevelOperator(string expr, string op)
++    {
++        var depth = 0;
++        for (var i = 0; i <= expr.Length - op.Length; i++)
++        {
++            if (expr[i] == '(') depth++;
++            else if (expr[i] == ')') depth--;
++            else if (depth == 0 && string.CompareOrdinal(expr, i, op, 0, op.Length) == 0)
++                return i;
++        }
++        return -1;
++    }
++
++    private static object? ResolveAtom(
++        string token,
++        KeysetItemRow row,
++        IDictionary<string, object?> parameters,
++        Func<KeysetItemRow, string, object?>? customExprEvaluator)
++    {
++        token = StripOuterParens(token);
++        if (token.StartsWith('@'))
++            return parameters[token];
++        if (int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var literalInt))
++            return literalInt;
++        return EvaluateColumnExpr(row, token, customExprEvaluator);
++    }
++}

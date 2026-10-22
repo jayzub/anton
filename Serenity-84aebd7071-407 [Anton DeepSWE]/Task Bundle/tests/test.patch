@@ -1,0 +1,2034 @@
+diff --git a/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetPagingTests.cs b/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetPagingTests.cs
+new file mode 100644
+index 000000000..cecf21010
+--- /dev/null
++++ b/tests/Serenity.Net.Tests/services/requesthandlers/list/ListRequestHandlerKeysetPagingTests.cs
+@@ -0,0 +1,2028 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Reflection;
++using System.Threading;
++using System.Threading.Tasks;
++using Xunit;
++using Serenity.Data;
++using Serenity.Services;
++using Serenity.TestUtils;
++
++namespace Serenity.Services;
++
++public class ListRequestHandlerKeysetPagingTests
++{
++    public enum KeysetStatus
++    {
++        Draft = 0,
++        Active = 1,
++        Archived = 2
++    }
++
++    [TableName("KeysetTestRows")]
++    public class KeysetTestRow : Row<KeysetTestRow.RowFields>, IIdRow
++    {
++        [Identity, IdProperty]
++        public int? Id { get => fields.Id[this]; set => fields.Id[this] = value; }
++        [NameProperty, QuickSearch]
++        public string? Name { get => fields.Name[this]; set => fields.Name[this] = value; }
++        public DateTime? CreatedAt { get => fields.CreatedAt[this]; set => fields.CreatedAt[this] = value; }
++        public DateTimeOffset? EventTime { get => fields.EventTime[this]; set => fields.EventTime[this] = value; }
++        public Guid? ExternalId { get => fields.ExternalId[this]; set => fields.ExternalId[this] = value; }
++        public decimal? Amount { get => fields.Amount[this]; set => fields.Amount[this] = value; }
++        public double? Score { get => fields.Score[this]; set => fields.Score[this] = value; }
++        public bool? IsActive { get => fields.IsActive[this]; set => fields.IsActive[this] = value; }
++        public KeysetStatus? Status { get => fields.Status[this]; set => fields.Status[this] = value; }
++        public string? Description { get => fields.Description[this]; set => fields.Description[this] = value; }
++
++        public class RowFields : RowFieldsBase
++        {
++            public Int32Field Id = null!;
++            public StringField Name = null!;
++            public DateTimeField CreatedAt = null!;
++            public DateTimeOffsetField EventTime = null!;
++            public GuidField ExternalId = null!;
++            public DecimalField Amount = null!;
++            public DoubleField Score = null!;
++            public BooleanField IsActive = null!;
++            public EnumField<KeysetStatus> Status = null!;
++            public StringField Description = null!;
++        }
++    }
++
++    private static MockDbConnection CreateMockConnection(ISqlDialect? dialect = null)
++    {
++        var conn = new MockDbConnection();
++        if (dialect != null)
++            conn.Dialect = dialect;
++        conn.OnDbCommandExecuteScalar(_ => 10);
++        conn.InterceptExecuteScalar(_ => 10);
++        return conn;
++    }
++
++    private static MockDbDataReader ToKeysetReader(InterceptExecuteReaderArgs args, params object[] items)
++    {
++        var cols = args?.Query is ISqlQueryExtensible ext && ext.Columns.Count > 0
++            ? ext.Columns.Select(c => c.ColumnName ?? (c.IntoField as IField)?.ColumnAlias ?? c.Expression).ToArray()
++            : ["Id", "Name", "CreatedAt", "EventTime", "ExternalId", "Amount", "Score", "IsActive", "Status", "Description"];
++        if (items == null || items.Length == 0)
++            return new MockDbDataReader(cols, Enumerable.Empty<IDictionary<string, object?>>());
++        return new MockDbDataReader(cols, items);
++    }
++
++
++    [TableName("PlainNoIdRows")]
++    public class PlainNoIdRow : Row<PlainNoIdRow.RowFields>
++    {
++        public int? Id { get => fields.Id[this]; set => fields.Id[this] = value; }
++        public string? Name { get => fields.Name[this]; set => fields.Name[this] = value; }
++
++        public class RowFields : RowFieldsBase
++        {
++            public Int32Field Id = null!;
++            public StringField Name = null!;
++        }
++    }
++
++    private static IRequestContext Context(params object[] behaviors)
++    {
++        if (behaviors == null || behaviors.Length == 0)
++            return new NullRequestContext().WithPermissions(_ => true);
++
++        var provider = new MockBehaviorProvider((_, _, _) => behaviors);
++        return new NullRequestContext(provider).WithPermissions(_ => true);
++    }
++
++    private static void SetPageToken(ListRequest request, string? token)
++    {
++        var prop = typeof(ListRequest).GetProperty("PageToken", BindingFlags.Public | BindingFlags.Instance)
++            ?? throw new Xunit.Sdk.XunitException("ListRequest does not define a public 'PageToken' property.");
++        prop.SetValue(request, token);
++    }
++
++    private static string? GetPageToken(ListRequest request)
++    {
++        var prop = typeof(ListRequest).GetProperty("PageToken", BindingFlags.Public | BindingFlags.Instance)
++            ?? throw new Xunit.Sdk.XunitException("ListRequest does not define a public 'PageToken' property.");
++        return (string?)prop.GetValue(request);
++    }
++
++    private static string? GetNextPageToken<T>(ListResponse<T> response)
++    {
++        var prop = typeof(ListResponse<T>).GetProperty("NextPageToken", BindingFlags.Public | BindingFlags.Instance)
++            ?? throw new Xunit.Sdk.XunitException("ListResponse<T> does not define a public 'NextPageToken' property.");
++        return (string?)prop.GetValue(response);
++    }
++
++    // -------------------------------------------------------------------------
++    // 1. Contract & Property Discovery
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void ListRequest_PageToken_Property_CanGetAndSet()
++    {
++        var request = new ListRequest();
++        var prop = typeof(ListRequest).GetProperty("PageToken", BindingFlags.Public | BindingFlags.Instance);
++        Assert.NotNull(prop);
++        Assert.Equal(typeof(string), prop.PropertyType);
++
++        prop.SetValue(request, "test-token");
++        Assert.Equal("test-token", prop.GetValue(request));
++
++        prop.SetValue(request, null);
++        Assert.Null(prop.GetValue(request));
++    }
++
++    [Fact]
++    public void ListResponse_NextPageToken_Property_CanGetAndSet()
++    {
++        var response = new ListResponse<KeysetTestRow>();
++        var prop = typeof(ListResponse<KeysetTestRow>).GetProperty("NextPageToken", BindingFlags.Public | BindingFlags.Instance);
++        Assert.NotNull(prop);
++        Assert.Equal(typeof(string), prop.PropertyType);
++
++        prop.SetValue(response, "next-token-val");
++        Assert.Equal("next-token-val", prop.GetValue(response));
++
++        prop.SetValue(response, null);
++        Assert.Null(prop.GetValue(response));
++    }
++
++    // -------------------------------------------------------------------------
++    // 2. Validation & Precondition Rules
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void PageToken_WithZeroTake_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(_ => new MockDbDataReader());
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 0, Skip = 0 };
++        SetPageToken(request, "some-token");
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, request));
++    }
++
++    [Fact]
++    public void PageToken_WithNegativeTake_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(_ => new MockDbDataReader());
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = -5, Skip = 0 };
++        SetPageToken(request, "some-token");
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, request));
++    }
++
++    [Fact]
++    public void PageToken_WithPositiveSkip_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(_ => new MockDbDataReader());
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 10, Skip = 5 };
++        SetPageToken(request, "some-token");
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, request));
++    }
++
++    [Fact]
++    public void PageToken_WithDistinctFields_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(_ => new MockDbDataReader());
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest
++        {
++            Take = 10,
++            Skip = 0,
++            DistinctFields = [new SortBy("Id", false)]
++        };
++        SetPageToken(request, "some-token");
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, request));
++    }
++
++    [Fact]
++    public void PageToken_WithRowWithoutIIdRow_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(_ => new MockDbDataReader());
++        var handler = new ListRequestHandler<PlainNoIdRow>(Context());
++        var request = new ListRequest { Take = 10, Skip = 0 };
++        SetPageToken(request, "some-token");
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, request));
++    }
++
++    [Fact]
++    public void PageToken_MalformedToken_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(_ => new MockDbDataReader());
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 10, Skip = 0 };
++        SetPageToken(request, "%%%NotABase64Token%%%");
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, request));
++    }
++
++    [Fact]
++    public void PageToken_CorruptedToken_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var initialRequest = new ListRequest { Take = 2, Skip = 0 };
++        var initialResponse = handler.List(connection, initialRequest);
++        var token = GetNextPageToken(initialResponse);
++        Assert.NotNull(token);
++
++        // Tamper with the token string
++        char[] chars = token.ToCharArray();
++        chars[chars.Length / 2] = chars[chars.Length / 2] == 'A' ? 'B' : 'A';
++        string tamperedToken = new string(chars);
++
++        var resumeRequest = new ListRequest { Take = 2, Skip = 0 };
++        SetPageToken(resumeRequest, tamperedToken);
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest));
++    }
++
++    [Fact]
++    public void PageToken_ReplayedWithDifferentSort_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var initialRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Sort = [new SortBy("Name", false)]
++        };
++        var initialResponse = handler.List(connection, initialRequest);
++        var token = GetNextPageToken(initialResponse);
++        Assert.NotNull(token);
++
++        var resumeRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Sort = [new SortBy("CreatedAt", false)] // Different sort!
++        };
++        SetPageToken(resumeRequest, token);
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest));
++    }
++
++    [Fact]
++    public void PageToken_ReplayedWithDifferentCriteria_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var initialRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Criteria = new Criteria("Name") == "A"
++        };
++        var initialResponse = handler.List(connection, initialRequest);
++        var token = GetNextPageToken(initialResponse);
++        Assert.NotNull(token);
++
++        var resumeRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Criteria = new Criteria("Name") == "Different" // Different criteria!
++        };
++        SetPageToken(resumeRequest, token);
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest));
++    }
++
++    [Fact]
++    public void PageToken_ReplayedWithDifferentEqualityFilter_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var initialRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            EqualityFilter = new Dictionary<string, object?> { ["Name"] = "A" }
++        };
++        var initialResponse = handler.List(connection, initialRequest);
++        var token = GetNextPageToken(initialResponse);
++        Assert.NotNull(token);
++
++        var resumeRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            EqualityFilter = new Dictionary<string, object?> { ["Name"] = "B" } // Different equality filter!
++        };
++        SetPageToken(resumeRequest, token);
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest));
++    }
++
++    [Fact]
++    public void PageToken_ReplayedWithDifferentContainsText_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var initialRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            ContainsText = "search1"
++        };
++        var initialResponse = handler.List(connection, initialRequest);
++        var token = GetNextPageToken(initialResponse);
++        Assert.NotNull(token);
++
++        var resumeRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            ContainsText = "search2" // Different contains text!
++        };
++        SetPageToken(resumeRequest, token);
++
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest));
++    }
++
++    // -------------------------------------------------------------------------
++    // 3. First Page & Keyset Inactivity
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void FirstPage_WithoutPageToken_PreservesSortOrderVerbatim_NoTiebreakerAdded()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, new { Id = 1, Name = "A" }, new { Id = 2, Name = "B" }, new { Id = 3, Name = "C" });
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Sort = [new SortBy("Name", false)]
++        };
++
++        var response = handler.List(connection, request);
++
++        Assert.NotNull(capturedSql);
++        var orderByIndex = capturedSql.IndexOf("ORDER BY", StringComparison.OrdinalIgnoreCase);
++        Assert.True(orderByIndex >= 0);
++        var semiColonIndex = capturedSql.IndexOf(';', orderByIndex);
++        var orderByClause = semiColonIndex >= 0 ? capturedSql[orderByIndex..semiColonIndex] : capturedSql[orderByIndex..];
++        Assert.Contains("Name", orderByClause, StringComparison.OrdinalIgnoreCase);
++        var nameIdx = orderByClause.IndexOf("Name", StringComparison.OrdinalIgnoreCase);
++        var idIdx = orderByClause.IndexOf("Id", StringComparison.OrdinalIgnoreCase);
++        Assert.True(nameIdx >= 0);
++        Assert.True(idIdx > nameIdx);
++        Assert.DoesNotContain("WHERE", capturedSql, StringComparison.OrdinalIgnoreCase);
++
++        var token = GetNextPageToken(response);
++        Assert.NotNull(token);
++    }
++
++    [Fact]
++    public void FirstPage_WhenMoreRowsExist_ReturnsNextPageToken()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args,
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" } // 3 rows when Take = 2
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0 };
++
++        var response = handler.List(connection, request);
++
++        var nextToken = GetNextPageToken(response);
++        Assert.NotNull(nextToken);
++        Assert.NotEmpty(nextToken);
++        Assert.Matches("^[A-Za-z0-9_-]+$", nextToken);
++    }
++
++    [Fact]
++    public void FirstPage_WhenNoMoreRowsExist_NextPageTokenIsNull()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" } // only 1 row when Take = 2
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0 };
++
++        var response = handler.List(connection, request);
++
++        var nextToken = GetNextPageToken(response);
++        Assert.Null(nextToken);
++    }
++
++    [Fact]
++    public void KeysetInactive_WithSkip_NextPageTokenIsNull()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 2 }; // Offset pagination active
++
++        var response = handler.List(connection, request);
++
++        var nextToken = GetNextPageToken(response);
++        Assert.Null(nextToken);
++    }
++
++    [Fact]
++    public void KeysetInactive_WithTakeZero_NextPageTokenIsNull()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 0, Skip = 0 };
++
++        var response = handler.List(connection, request);
++
++        var nextToken = GetNextPageToken(response);
++        Assert.Null(nextToken);
++    }
++
++    [Fact]
++    public void KeysetInactive_WithDistinctFields_NextPageTokenIsNull()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1 },
++                new { Id = 2 }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            DistinctFields = [new SortBy("Id", false)]
++        };
++
++        var response = handler.List(connection, request);
++
++        var nextToken = GetNextPageToken(response);
++        Assert.Null(nextToken);
++    }
++
++    [Fact]
++    public void KeysetInactive_RowWithoutIIdRow_NextPageTokenIsNull()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" }
++            ));
++        var handler = new ListRequestHandler<PlainNoIdRow>(Context());
++        var request = new ListRequest { Take = 1, Skip = 0 };
++
++        var response = handler.List(connection, request);
++
++        var nextToken = GetNextPageToken(response);
++        Assert.Null(nextToken);
++    }
++
++    // -------------------------------------------------------------------------
++    // 4. Over-fetch Invisibility & Response Metadata
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void KeysetPaging_ProbeRow_NeverLeaksIntoResponseEntities()
++    {
++        int capturedQueryTake = 0;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                if (args?.Query is SqlQuery sq)
++                    capturedQueryTake = sq.Take();
++                return ToKeysetReader(args,
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = "B" },
++                    new { Id = 3, Name = "C" } // Over-fetch probe row
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0 };
++
++        var response = handler.List(connection, request);
++
++        Assert.Equal(3, capturedQueryTake);
++        Assert.Equal(2, response.Entities.Count);
++        Assert.Equal(1, response.Entities[0].Id);
++        Assert.Equal(2, response.Entities[1].Id);
++    }
++
++    [Fact]
++    public void KeysetPaging_ResponseTake_MatchesRequestedTake()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0 };
++
++        var response = handler.List(connection, request);
++
++        var token = GetNextPageToken(response);
++        Assert.NotNull(token);
++        Assert.Equal(2, response.Take);
++    }
++
++    [Fact]
++    public void KeysetPaging_ResponseSkip_RemainsZero()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0 };
++
++        var response = handler.List(connection, request);
++
++        var token = GetNextPageToken(response);
++        Assert.NotNull(token);
++        Assert.Equal(0, response.Skip);
++    }
++
++    [Fact]
++    public void KeysetPaging_TotalCount_CalculatedUnlessExcluded()
++    {
++        int executeReaderCalls = 0;
++        using var connection = CreateMockConnection(PostgresDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                executeReaderCalls++;
++                return ToKeysetReader(args,
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = "B" },
++                    new { Id = 3, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0, ExcludeTotalCount = false };
++
++        var response = handler.List(connection, request);
++
++        var token = GetNextPageToken(response);
++        Assert.NotNull(token);
++        Assert.Equal(10, response.TotalCount);
++    }
++
++    [Fact]
++    public void KeysetPaging_ExcludeTotalCount_DoesNotComputeTotalCount()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0, ExcludeTotalCount = true };
++
++        var response = handler.List(connection, request);
++
++        var token = GetNextPageToken(response);
++        Assert.NotNull(token);
++        Assert.Equal(0, response.TotalCount);
++    }
++
++    // -------------------------------------------------------------------------
++    // 5. Effective Sort Order & ID Tiebreaker
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void EffectiveSort_AppendsIdTiebreaker_WhenNotPresentInSort()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = "B" },
++                    new { Id = 3, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var orderByIndex = capturedSql.IndexOf("ORDER BY", StringComparison.OrdinalIgnoreCase);
++        Assert.True(orderByIndex >= 0);
++        var orderByClause = capturedSql[orderByIndex..];
++        // Must contain Name then Id tiebreaker ascending
++        Assert.Contains("Name", orderByClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Id", orderByClause, StringComparison.OrdinalIgnoreCase);
++        var idIndex = orderByClause.IndexOf("Id", StringComparison.OrdinalIgnoreCase);
++        Assert.True(idIndex >= 0);
++        var afterId = orderByClause[idIndex..];
++        Assert.DoesNotContain("DESC", afterId, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void EffectiveSort_DoesNotDuplicateId_WhenAlreadyPresentInSort()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = "B" },
++                    new { Id = 3, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Id", true)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Id", true)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var orderByIndex = capturedSql.IndexOf("ORDER BY", StringComparison.OrdinalIgnoreCase);
++        Assert.True(orderByIndex >= 0);
++        var semiColonIndex = capturedSql.IndexOf(';', orderByIndex);
++        var orderByClause = semiColonIndex >= 0 ? capturedSql[orderByIndex..semiColonIndex] : capturedSql[orderByIndex..];
++        // Count occurrences of "Id" in order by: should only appear once
++        int idCount = 0;
++        int idx = 0;
++        while ((idx = orderByClause.IndexOf("Id", idx, StringComparison.OrdinalIgnoreCase)) != -1)
++        {
++            idCount++;
++            idx += 2;
++        }
++        Assert.Equal(1, idCount);
++    }
++
++    [Fact]
++    public void EffectiveSort_FallsBackToNativeSort_WhenRequestSortEmpty()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = "B" },
++                    new { Id = 3, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0 };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0 };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var orderByIndex = capturedSql.IndexOf("ORDER BY", StringComparison.OrdinalIgnoreCase);
++        Assert.True(orderByIndex >= 0);
++        var orderByClause = capturedSql[orderByIndex..];
++        // Must contain native sort (Name) and Id tiebreaker
++        Assert.Contains("Name", orderByClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Id", orderByClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    // -------------------------------------------------------------------------
++    // 6. Dialect NULL Ordering & Seek Predicates
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void SeekPredicate_SqlServer_Asc_NonNullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(SqlServer2012Dialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, new { Id = 1, Name = "A" }, new { Id = 2, Name = "B" }, new { Id = 3, Name = "C" });
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // SqlServer ASC: NULLs first. For non-null boundary 'B', strictly after rows must have Name > @p (or tie on Name with Id > @p).
++        // It must NOT say 'OR Name IS NULL' because NULLs come before 'B' in ASC order!
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.DoesNotContain("IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_SqlServer_Asc_NullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(SqlServer2012Dialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = (string?)null },
++                    new { Id = 2, Name = (string?)null },
++                    new { Id = 3, Name = "Alpha" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // SqlServer ASC with NULL boundary: non-nulls come AFTER null, so predicate must include IS NOT NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NOT NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_SqlServer_Desc_NonNullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(SqlServer2012Dialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, new { Id = 1, Name = "B" }, new { Id = 2, Name = "A" }, new { Id = 3, Name = (string?)null });
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // SqlServer DESC: NULLs last. Non-null boundary 'A' -> strictly after includes Name < @p OR Name IS NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_SqlServer_Desc_NullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(SqlServer2012Dialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = (string?)null },
++                    new { Id = 2, Name = (string?)null },
++                    new { Id = 3, Name = (string?)null }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // SqlServer DESC with NULL boundary: NULLs are at the end, so no rows can be strictly after NULL on Name.
++        // The predicate for Name must only be Name IS NULL (for equality to tiebreaker Id).
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.DoesNotContain("IS NOT NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_Postgres_Asc_NonNullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(PostgresDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, new { Id = 1, Name = "A" }, new { Id = 2, Name = "B" }, new { Id = 3, Name = "C" });
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // Postgres ASC: NULLs sort LAST! For non-null boundary 'B', rows strictly after must include Name > @p OR Name IS NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_Postgres_Asc_NullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(PostgresDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = (string?)null },
++                    new { Id = 2, Name = (string?)null },
++                    new { Id = 3, Name = (string?)null }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // Postgres ASC with NULL boundary: NULLs are at the end, so no non-nulls come after NULL!
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.DoesNotContain("IS NOT NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_Postgres_Desc_NonNullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(PostgresDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, new { Id = 1, Name = "B" }, new { Id = 2, Name = "A" }, new { Id = 3, Name = (string?)null });
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // Postgres DESC: NULLs first! Non-null boundary 'A' -> NULLs already appeared at beginning, so Name strictly after must NOT include IS NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.DoesNotContain("Name] IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.DoesNotContain("Name IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_Postgres_Desc_NullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(PostgresDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = (string?)null },
++                    new { Id = 2, Name = (string?)null },
++                    new { Id = 3, Name = "Z" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // Postgres DESC with NULL boundary: NULLs come first in DESC, so non-nulls come AFTER NULL -> IS NOT NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NOT NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_MySql_Asc_NullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(MySqlDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = (string?)null },
++                    new { Id = 2, Name = (string?)null },
++                    new { Id = 3, Name = "M" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // MySQL NULLs first in ASC -> non-nulls come after null -> IS NOT NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NOT NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_Sqlite_Desc_NonNullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(SqliteDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, new { Id = 1, Name = "B" }, new { Id = 2, Name = "A" }, new { Id = 3, Name = (string?)null });
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // Sqlite NULLs last in DESC -> includes IS NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_Oracle_Asc_NonNullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(OracleDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, new { Id = 1, Name = "A" }, new { Id = 2, Name = "B" }, new { Id = 3, Name = "C" });
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // Oracle NULLs last in ASC -> includes IS NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_Firebird_Desc_NullBoundary()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(FirebirdDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = (string?)null },
++                    new { Id = 2, Name = (string?)null },
++                    new { Id = 3, Name = "F" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", true)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        // Firebird NULLs first in DESC -> non-nulls come after -> IS NOT NULL
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NOT NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    // -------------------------------------------------------------------------
++    // 7. Non-Null Parameterization
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void SeekPredicate_NonNullValues_AreParameterized()
++    {
++        IDictionary<string, object?>? capturedParams = null;
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 10, Name = "AlphaSpecialValue123" },
++                    new { Id = 20, Name = "BetaSpecialValue456" },
++                    new { Id = 30, Name = "GammaSpecialValue789" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        Assert.NotNull(capturedParams);
++        // The literal boundary value must not be inlined in the SQL query text
++        Assert.DoesNotContain("'BetaSpecialValue456'", capturedSql);
++        // And must exist in the parameters dictionary
++        Assert.Contains(capturedParams.Values, v => v != null && v.ToString() == "BetaSpecialValue456");
++    }
++
++    // -------------------------------------------------------------------------
++    // 8. Multi-Column Composite Sort
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void SeekPredicate_MultiColumn_LexicographicExpansion()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = "A", Amount = 100m },
++                    new { Id = 2, Name = "A", Amount = 200m },
++                    new { Id = 3, Name = "B", Amount = 100m }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Sort = [new SortBy("Name", false), new SortBy("Amount", false)]
++        };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Sort = [new SortBy("Name", false), new SortBy("Amount", false)]
++        };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        // Lexicographic expansion must contain OR between the expansion terms
++        Assert.Contains(" OR ", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Name", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Amount", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Id", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_MultiColumn_MixedDirections()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = "A", Score = 99.5 },
++                    new { Id = 2, Name = "B", Score = 88.0 },
++                    new { Id = 3, Name = "B", Score = 77.0 }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Sort = [new SortBy("Name", false), new SortBy("Score", true)] // ASC on Name, DESC on Score
++        };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            Sort = [new SortBy("Name", false), new SortBy("Score", true)]
++        };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains(">", whereClause);
++        Assert.Contains("<", whereClause);
++    }
++
++    // -------------------------------------------------------------------------
++    // 9. Type Fidelity & Round-Trip
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void TypeFidelity_DateTime_PreservesTicks()
++    {
++        var targetDt = new DateTime(2026, 9, 23, 14, 30, 45, 123, DateTimeKind.Utc).AddTicks(4567);
++        IDictionary<string, object?>? capturedParams = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                return ToKeysetReader(args, 
++                    new { Id = 1, CreatedAt = targetDt.AddSeconds(-10) },
++                    new { Id = 2, CreatedAt = targetDt },
++                    new { Id = 3, CreatedAt = targetDt.AddSeconds(10) }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("CreatedAt", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("CreatedAt", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedParams);
++        var param = capturedParams.Values.OfType<DateTime>().FirstOrDefault(d => d.Date == targetDt.Date);
++        Assert.Equal(targetDt.Ticks, param.Ticks);
++    }
++
++    [Fact]
++    public void TypeFidelity_DateTimeOffset_PreservesOffsetAndTicks()
++    {
++        var targetDto = new DateTimeOffset(2026, 9, 23, 14, 30, 45, TimeSpan.FromHours(5)).AddTicks(7890);
++        IDictionary<string, object?>? capturedParams = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                return ToKeysetReader(args, 
++                    new { Id = 1, EventTime = targetDto.AddSeconds(-5) },
++                    new { Id = 2, EventTime = targetDto },
++                    new { Id = 3, EventTime = targetDto.AddSeconds(5) }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("EventTime", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("EventTime", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedParams);
++        var param = capturedParams.Values.OfType<DateTimeOffset>().FirstOrDefault();
++        Assert.Equal(targetDto.Offset, param.Offset);
++        Assert.Equal(targetDto.Ticks, param.Ticks);
++    }
++
++    [Fact]
++    public void TypeFidelity_Guid_PreservesExactGuid()
++    {
++        var targetGuid = Guid.Parse("a818c4d2-7b0b-4eb1-995c-7d9263152661");
++        IDictionary<string, object?>? capturedParams = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                return ToKeysetReader(args, 
++                    new { Id = 1, ExternalId = Guid.NewGuid() },
++                    new { Id = 2, ExternalId = targetGuid },
++                    new { Id = 3, ExternalId = Guid.NewGuid() }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("ExternalId", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("ExternalId", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedParams);
++        var param = capturedParams.Values.OfType<Guid>().FirstOrDefault();
++        Assert.Equal(targetGuid, param);
++    }
++
++    [Fact]
++    public void TypeFidelity_Decimal_PreservesPrecision()
++    {
++        var targetDecimal = 123456789.987654321m;
++        IDictionary<string, object?>? capturedParams = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Amount = 100.0m },
++                    new { Id = 2, Amount = targetDecimal },
++                    new { Id = 3, Amount = 999999999.0m }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Amount", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Amount", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedParams);
++        var param = capturedParams.Values.OfType<decimal>().FirstOrDefault();
++        Assert.Equal(targetDecimal, param);
++    }
++
++    [Fact]
++    public void TypeFidelity_Double_PreservesPrecision()
++    {
++        var targetDouble = 3.141592653589793;
++        IDictionary<string, object?>? capturedParams = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Score = 1.0 },
++                    new { Id = 2, Score = targetDouble },
++                    new { Id = 3, Score = 5.0 }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Score", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Score", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedParams);
++        var param = capturedParams.Values.OfType<double>().FirstOrDefault();
++        Assert.Equal(targetDouble, param, 12);
++    }
++
++    [Fact]
++    public void TypeFidelity_Boolean_PreservesValue()
++    {
++        IDictionary<string, object?>? capturedParams = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                return ToKeysetReader(args, 
++                    new { Id = 1, IsActive = false },
++                    new { Id = 2, IsActive = true },
++                    new { Id = 3, IsActive = true }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("IsActive", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("IsActive", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedParams);
++        Assert.Contains(capturedParams.Values, v => v is bool b && b == true);
++    }
++
++    [Fact]
++    public void TypeFidelity_Enum_PreservesValue()
++    {
++        IDictionary<string, object?>? capturedParams = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Status = KeysetStatus.Draft },
++                    new { Id = 2, Status = KeysetStatus.Active },
++                    new { Id = 3, Status = KeysetStatus.Archived }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Status", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Status", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedParams);
++        Assert.Contains(capturedParams.Values, v => Convert.ToInt64(v) == (long)KeysetStatus.Active);
++    }
++
++    [Fact]
++    public void TypeFidelity_String_PreservesValue()
++    {
++        IDictionary<string, object?>? capturedParams = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedParams = args.Parameters;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = "First" },
++                    new { Id = 2, Name = "Exact String Boundary Value !@#" },
++                    new { Id = 3, Name = "Third" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedParams);
++        Assert.Contains(capturedParams.Values, v => v != null && v.ToString() == "Exact String Boundary Value !@#");
++    }
++
++    [Fact]
++    public void TypeFidelity_Null_PreservesNull()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = (string?)null },
++                    new { Id = 3, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    // -------------------------------------------------------------------------
++    // 10. Force-Selection of Sort Fields
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void ForceSelection_ColumnSelectionKeyOnly_SelectsSortFields()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, CreatedAt = DateTime.UtcNow, Name = "A" },
++                    new { Id = 2, CreatedAt = DateTime.UtcNow, Name = "B" },
++                    new { Id = 3, CreatedAt = DateTime.UtcNow, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            ColumnSelection = ColumnSelection.KeyOnly,
++            Sort = [new SortBy("CreatedAt", false)]
++        };
++
++        var response = handler.List(connection, request);
++
++        Assert.NotNull(capturedSql);
++        var selectIndex = capturedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
++        var fromIndex = capturedSql.IndexOf("FROM", StringComparison.OrdinalIgnoreCase);
++        var selectClause = capturedSql[selectIndex..fromIndex];
++        // Even under KeyOnly, CreatedAt must be selected so boundary value can be extracted
++        Assert.Contains("CreatedAt", selectClause, StringComparison.OrdinalIgnoreCase);
++
++        var token = GetNextPageToken(response);
++        Assert.NotNull(token);
++    }
++
++    [Fact]
++    public void ForceSelection_ExcludeColumns_SelectsSortFields()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = "B" },
++                    new { Id = 3, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var request = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            ExcludeColumns = ["Name"],
++            Sort = [new SortBy("Name", false)]
++        };
++
++        var response = handler.List(connection, request);
++
++        Assert.NotNull(capturedSql);
++        var selectIndex = capturedSql.IndexOf("SELECT", StringComparison.OrdinalIgnoreCase);
++        var fromIndex = capturedSql.IndexOf("FROM", StringComparison.OrdinalIgnoreCase);
++        var selectClause = capturedSql[selectIndex..fromIndex];
++        // Name was in ExcludeColumns, but it is a sort column, so it must still be selected
++        Assert.Contains("Name", selectClause, StringComparison.OrdinalIgnoreCase);
++
++        var token = GetNextPageToken(response);
++        Assert.NotNull(token);
++    }
++
++    // -------------------------------------------------------------------------
++    // 11. Mapped Field Expressions
++    // -------------------------------------------------------------------------
++
++    private sealed class CustomDescriptionMappingBehavior : BaseListBehavior, IListMapFieldExpressionBehavior
++    {
++        public string? MapFieldExpression(IListRequestHandler handler, SqlQuery query, IField field)
++        {
++            if (field.Name == "Description")
++                return "COALESCE(T1.[Description], T0.[Description])";
++            return null;
++        }
++    }
++
++    [Fact]
++    public void MappedExpression_Localization_UsedInSeekPredicate()
++    {
++        string? capturedSql = null;
++        var behavior = new CustomDescriptionMappingBehavior();
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, 
++                    new { Id = 1, Description = "Desc1" },
++                    new { Id = 2, Description = "Desc2" },
++                    new { Id = 3, Description = "Desc3" }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context(behavior));
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Description", false)] };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Description", false)] };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        // The seek filter must use the mapped expression COALESCE(...) rather than raw [Description]
++        Assert.Contains("COALESCE", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    // -------------------------------------------------------------------------
++    // 12. Asynchronous Pipeline Parity
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public async Task Async_ListAsync_ReturnsRows_WithNextPageToken()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args, 
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandlerAsync<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0 };
++
++        var response = await handler.ListAsync(connection, request, CancellationToken.None);
++
++        Assert.NotNull(response);
++        Assert.Equal(2, response.Entities.Count);
++        var nextToken = GetNextPageToken(response);
++        Assert.NotNull(nextToken);
++        Assert.NotEmpty(nextToken);
++        Assert.Matches("^[A-Za-z0-9_-]+$", nextToken);
++    }
++
++    [Fact]
++    public async Task Async_ListAsync_ResumesWithPageToken()
++    {
++        string? capturedSql = null;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args,
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = "B" },
++                    new { Id = 3, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandlerAsync<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = await handler.ListAsync(connection, req1, CancellationToken.None);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        var res2 = await handler.ListAsync(connection, req2, CancellationToken.None);
++
++        Assert.NotNull(res2);
++        Assert.NotNull(capturedSql);
++        Assert.Contains("WHERE", capturedSql, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public async Task Async_ListAsync_ValidationErrors_MatchSync()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(_ => new MockDbDataReader());
++        var handler = new ListRequestHandlerAsync<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 0, Skip = 0 };
++        SetPageToken(request, "invalid-token");
++
++        await Assert.ThrowsAsync<ValidationError>(() => handler.ListAsync(connection, request, CancellationToken.None));
++    }
++
++    [Fact]
++    public async Task Async_ListAsync_OverFetchInvisibility()
++    {
++        int capturedQueryTake = 0;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                if (args?.Query is SqlQuery sq)
++                    capturedQueryTake = sq.Take();
++                return ToKeysetReader(args,
++                    new { Id = 1, Name = "A" },
++                    new { Id = 2, Name = "B" },
++                    new { Id = 3, Name = "C" }
++                );
++            });
++        var handler = new ListRequestHandlerAsync<KeysetTestRow>(Context());
++        var request = new ListRequest { Take = 2, Skip = 0 };
++
++        var response = await handler.ListAsync(connection, request, CancellationToken.None);
++
++        Assert.Equal(3, capturedQueryTake);
++        Assert.Equal(2, response.Entities.Count);
++        Assert.Equal(2, response.Take);
++        Assert.Equal(0, response.Skip);
++    }
++
++    [Fact]
++    public async Task Async_ListAsync_DialectNullOrdering()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(PostgresDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args, new { Id = 1, Name = "A" }, new { Id = 2, Name = "B" }, new { Id = 3, Name = "C" });
++            });
++        var handler = new ListRequestHandlerAsync<KeysetTestRow>(Context());
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        var res1 = await handler.ListAsync(connection, req1, CancellationToken.None);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = [new SortBy("Name", false)] };
++        SetPageToken(req2, token);
++        await handler.ListAsync(connection, req2, CancellationToken.None);
++
++        Assert.NotNull(capturedSql);
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    // -------------------------------------------------------------------------
++    // 11. Hardened Invalidation & Traps (IncludeDeleted, ContainsField, MultiPage, 3-Col)
++    // -------------------------------------------------------------------------
++
++    [Fact]
++    public void PageToken_ReplayedWithDifferentIncludeDeleted_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args,
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++
++        // Case 1: issued with IncludeDeleted = false, replayed with IncludeDeleted = true
++        var initialRequest1 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            IncludeDeleted = false
++        };
++        var initialResponse1 = handler.List(connection, initialRequest1);
++        var token1 = GetNextPageToken(initialResponse1);
++        Assert.NotNull(token1);
++
++        var resumeRequest1 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            IncludeDeleted = true
++        };
++        SetPageToken(resumeRequest1, token1);
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest1));
++
++        // Case 2: issued with IncludeDeleted = true, replayed with IncludeDeleted = false
++        var initialRequest2 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            IncludeDeleted = true
++        };
++        var initialResponse2 = handler.List(connection, initialRequest2);
++        var token2 = GetNextPageToken(initialResponse2);
++        Assert.NotNull(token2);
++
++        var resumeRequest2 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            IncludeDeleted = false
++        };
++        SetPageToken(resumeRequest2, token2);
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest2));
++    }
++
++    [Fact]
++    public void PageToken_ReplayedWithDifferentContainsField_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args,
++                new { Id = 1, Name = "A", Description = "Desc A" },
++                new { Id = 2, Name = "B", Description = "Desc B" },
++                new { Id = 3, Name = "C", Description = "Desc C" }
++            ));
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++
++        // Case 1: issued with ContainsField = "Name", replayed with ContainsField = "Description"
++        var initialRequest1 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            ContainsText = "test",
++            ContainsField = "Name"
++        };
++        var initialResponse1 = handler.List(connection, initialRequest1);
++        var token1 = GetNextPageToken(initialResponse1);
++        Assert.NotNull(token1);
++
++        var resumeRequest1 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            ContainsText = "test",
++            ContainsField = "Description"
++        };
++        SetPageToken(resumeRequest1, token1);
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest1));
++
++        // Case 2: issued with ContainsField = "Name", replayed with ContainsField = null
++        var resumeRequest2 = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            ContainsText = "test",
++            ContainsField = null
++        };
++        SetPageToken(resumeRequest2, token1);
++        Assert.Throws<ValidationError>(() => handler.List(connection, resumeRequest2));
++    }
++
++    [Fact]
++    public async Task Async_ListAsync_PageToken_ReplayedWithDifferentIncludeDeleted_ThrowsValidationError()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args => ToKeysetReader(args,
++                new { Id = 1, Name = "A" },
++                new { Id = 2, Name = "B" },
++                new { Id = 3, Name = "C" }
++            ));
++        var handler = new ListRequestHandlerAsync<KeysetTestRow>(Context());
++        var initialRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            IncludeDeleted = false
++        };
++        var initialResponse = await handler.ListAsync(connection, initialRequest, CancellationToken.None);
++        var token = GetNextPageToken(initialResponse);
++        Assert.NotNull(token);
++
++        var resumeRequest = new ListRequest
++        {
++            Take = 2,
++            Skip = 0,
++            IncludeDeleted = true
++        };
++        SetPageToken(resumeRequest, token);
++        await Assert.ThrowsAsync<ValidationError>(() => handler.ListAsync(connection, resumeRequest, CancellationToken.None));
++    }
++
++    [Fact]
++    public void PageToken_WhenNoFurtherRowsMatch_ReturnsEmptyEntitiesAndNullToken()
++    {
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                if (args.CommandText.Contains("WHERE", StringComparison.OrdinalIgnoreCase))
++                    return ToKeysetReader(args);
++                return ToKeysetReader(args, new { Id = 1, Name = "A" }, new { Id = 2, Name = "B" }, new { Id = 3, Name = "C" });
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var initialRequest = new ListRequest { Take = 2, Skip = 0 };
++        var initialResponse = handler.List(connection, initialRequest);
++        var token = GetNextPageToken(initialResponse);
++        Assert.NotNull(token);
++
++        var resumeRequest = new ListRequest { Take = 2, Skip = 0 };
++        SetPageToken(resumeRequest, token);
++        var resumeResponse = handler.List(connection, resumeRequest);
++
++        Assert.NotNull(resumeResponse.Entities);
++        Assert.Empty(resumeResponse.Entities);
++        Assert.Null(GetNextPageToken(resumeResponse));
++        Assert.Equal(2, resumeResponse.Take);
++        Assert.Equal(0, resumeResponse.Skip);
++    }
++
++    [Fact]
++    public void MultiPage_ContinuousPaging_AcrossThreePages_WithDuplicateSortValues()
++    {
++        var allData = new[]
++        {
++            new { Id = 1, Name = "Item1", Score = (double?)10.0 },
++            new { Id = 2, Name = "Item2", Score = (double?)10.0 },
++            new { Id = 3, Name = "Item3", Score = (double?)10.0 },
++            new { Id = 4, Name = "Item4", Score = (double?)20.0 },
++            new { Id = 5, Name = "Item5", Score = (double?)30.0 }
++        };
++
++        int callCount = 0;
++        using var connection = new MockDbConnection()
++            .InterceptExecuteReader(args =>
++            {
++                callCount++;
++                if (callCount == 1)
++                    return ToKeysetReader(args, allData[0], allData[1], allData[2]);
++                else if (callCount == 2)
++                    return ToKeysetReader(args, allData[2], allData[3], allData[4]);
++                else
++                    return ToKeysetReader(args, allData[4]);
++            });
++
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var sort = new[] { new SortBy("Score", false) };
++
++        // Page 1
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = sort };
++        var res1 = handler.List(connection, req1);
++        Assert.Equal(2, res1.Entities.Count);
++        Assert.Equal(1, res1.Entities[0].Id);
++        Assert.Equal(2, res1.Entities[1].Id);
++        var token1 = GetNextPageToken(res1);
++        Assert.NotNull(token1);
++
++        // Page 2
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = sort };
++        SetPageToken(req2, token1);
++        var res2 = handler.List(connection, req2);
++        Assert.Equal(2, res2.Entities.Count);
++        Assert.Equal(3, res2.Entities[0].Id);
++        Assert.Equal(4, res2.Entities[1].Id);
++        var token2 = GetNextPageToken(res2);
++        Assert.NotNull(token2);
++
++        // Page 3
++        var req3 = new ListRequest { Take = 2, Skip = 0, Sort = sort };
++        SetPageToken(req3, token2);
++        var res3 = handler.List(connection, req3);
++        Assert.Single(res3.Entities);
++        Assert.Equal(5, res3.Entities[0].Id);
++        Assert.Null(GetNextPageToken(res3));
++    }
++
++    [Fact]
++    public void SeekPredicate_ThreeColumns_SqlServer_MiddleNull()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(SqlServer2012Dialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args,
++                    new { Id = 10, Amount = (decimal?)100m, Score = (double?)null },
++                    new { Id = 20, Amount = (decimal?)100m, Score = (double?)null },
++                    new { Id = 30, Amount = (decimal?)50m, Score = (double?)5.0 }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var sort = new[]
++        {
++            new SortBy("Amount", true),
++            new SortBy("Score", false),
++            new SortBy("Id", false)
++        };
++
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = sort };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = sort };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("Amount", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("<", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Score", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("IS NOT NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Id", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains(">", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++
++    [Fact]
++    public void SeekPredicate_ThreeColumns_Postgres_MiddleNull()
++    {
++        string? capturedSql = null;
++        using var connection = CreateMockConnection(PostgresDialect.Instance)
++            .InterceptExecuteReader(args =>
++            {
++                capturedSql = args.CommandText;
++                return ToKeysetReader(args,
++                    new { Id = 10, Amount = (decimal?)100m, Score = (double?)null },
++                    new { Id = 20, Amount = (decimal?)100m, Score = (double?)null },
++                    new { Id = 30, Amount = (decimal?)50m, Score = (double?)5.0 }
++                );
++            });
++        var handler = new ListRequestHandler<KeysetTestRow>(Context());
++        var sort = new[]
++        {
++            new SortBy("Amount", true),
++            new SortBy("Score", false),
++            new SortBy("Id", false)
++        };
++
++        var req1 = new ListRequest { Take = 2, Skip = 0, Sort = sort };
++        var res1 = handler.List(connection, req1);
++        var token = GetNextPageToken(res1);
++        Assert.NotNull(token);
++
++        var req2 = new ListRequest { Take = 2, Skip = 0, Sort = sort };
++        SetPageToken(req2, token);
++        handler.List(connection, req2);
++
++        Assert.NotNull(capturedSql);
++        var whereClause = capturedSql.Substring(capturedSql.IndexOf("WHERE", StringComparison.OrdinalIgnoreCase));
++        Assert.Contains("Amount", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("<", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.DoesNotContain("Amount\" IS NULL", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Score", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains("Id", whereClause, StringComparison.OrdinalIgnoreCase);
++        Assert.Contains(">", whereClause, StringComparison.OrdinalIgnoreCase);
++    }
++}
